@@ -235,23 +235,20 @@ impl CallLlmRequest {
     }
 }
 
-/// The libsy-typed request pump: a [`TypeErasedDriver`](crate::driver::TypeErasedDriver)
-/// specialized to libsy's request vocabulary. [`call_llm`](Self::call_llm) /
-/// [`call_llm_target`](Self::call_llm_target) offload a call and await a [`Response`];
-/// [`info`](Self::info) publishes a [`Decision`]; [`finish`](Self::finish) emits the
-/// terminal [`Response`]; and [`stream`](Self::stream) transforms the raw driver stream
-/// into a stream of [`Step`]s. The underlying step channel is bounded (capacity 1), so
-/// the consumer paces the algorithm one step at a time. Cloning shares the same channel
-/// (the producer side): [`run_stream`](Algorithm::run_stream) takes the consumer
-/// stream, then hands a clone to the algorithm task to publish on.
+/// The offload channel handed to an algorithm's
+/// [`create_run_task`](Algorithm::create_run_task). The algorithm makes model calls
+/// with [`call_llm_target`](Self::call_llm_target) (or [`call_llm`](Self::call_llm)) and
+/// publishes its [`Decision`]s with [`info`](Self::info); each call is offloaded to the
+/// request's [`Step`] stream and awaits the consumer's response. The step channel is
+/// bounded, so the consumer paces the algorithm one step at a time.
 #[derive(Clone)]
 pub struct Driver {
     driver: TypeErasedDriver,
 }
 
 impl Driver {
-    /// Build an empty driver with its step channel ready. Internal: created per call
-    /// by [`run_stream`](Algorithm::run_stream), not by hosts.
+    /// Build an empty driver with its step channel ready. Created per call by
+    /// [`run_stream`](Algorithm::run_stream).
     pub(crate) fn new() -> Self {
         Self {
             driver: TypeErasedDriver::new(),
@@ -324,13 +321,9 @@ impl Default for Driver {
     }
 }
 
-/// Per-request state threaded to an algorithm alongside its [`Driver`].
-///
-/// A placeholder for cross-cutting request state — correlation ids, budgets,
-/// deadlines, cancellation — that algorithms will read as the enum grows. It does
-/// *not* carry the offload driver: that is created per call by
-/// [`run_stream`](Algorithm::run_stream) and passed separately, so sharing a
-/// `Context` across concurrent requests is safe.
+/// Per-request state threaded to an algorithm alongside its [`Driver`]. A placeholder
+/// for cross-cutting state (correlation ids, budgets, deadlines) an algorithm will
+/// read; empty today. It does not carry the offload driver, so it is safe to share.
 #[derive(Clone, Default)]
 pub struct Context {}
 
@@ -368,20 +361,18 @@ pub trait LlmClient: Send + Sync {
     async fn call(&self, request: RoutedRequest) -> Result<Response, Box<dyn Error + Send + Sync>>;
 }
 
-/// A named routing target, optionally backed by an [`LlmClient`].
-///
-/// An algorithm selects a target by its [`semantic_name`](Self::semantic_name) and
-/// calls it. [`call`](Self::call) offloads every call to the request's stream via the
-/// [`Context`] it is given; the target's client, if any, rides along as
+/// A named routing target: a `semantic_name` an algorithm routes by, and an optional
+/// [`LlmClient`] to serve its calls. An algorithm hands a target to
+/// [`Driver::call_llm_target`]; the client rides along as
 /// [`RoutedRequest::default_client`] for the stream consumer to serve or override.
 #[derive(Clone)]
 pub struct LlmTarget {
-    /// The routing name an algorithm selects this target by (a logical tier like
-    /// `"strong"`, or the model id when they coincide). How this name maps to a
-    /// provider model id is the caller's concern — encapsulated in `llm_client`
-    /// (or the host fulfilling an offload), never in the algorithm.
+    /// The routing label an algorithm selects this target by — a logical tier like
+    /// `"strong"`, or the model id when they coincide. Mapping it to a provider model
+    /// id is the client's concern, never the algorithm's.
     pub semantic_name: String,
-    /// The client that serves calls, or `None` to offload them.
+    /// The client that serves this target's calls by default, or `None` (then the
+    /// stream consumer must serve them).
     pub llm_client: Option<Arc<dyn LlmClient>>,
 }
 
@@ -414,28 +405,20 @@ impl LlmTargetSet {
     }
 }
 
-/// A stateful optimization algorithm. `create_run_task` runs once per request;
-/// inside it the algorithm makes as many `Driver::call_llm_target`s as it needs (all
-/// offloaded to the request's stream via [`Driver::call_llm`]), publishes its
-/// decisions with [`Driver::info`], and returns the final response. The provided
-/// [`run_stream`](Algorithm::run_stream) drives that task on its own task and
-/// hands back the [`Step`] stream; [`run`](Algorithm::run)
-/// runs it to completion with the targets' default clients.
+/// An optimization strategy. Implement [`create_run_task`](Self::create_run_task);
+/// callers drive it with the provided [`run`](Self::run) (serve calls, get the answer)
+/// or [`run_stream`](Self::run_stream) (drive the [`Step`] stream yourself).
 ///
-/// Methods take `self: Arc<Self>` / `&self`, not `&mut self`: the orchestrator shares
-/// one algorithm (`Arc<dyn Algorithm>`) across all requests and calls it concurrently,
-/// so an algorithm is responsible for its own thread-safety. Stateless algorithms
-/// (like the reference routers) get this for free; a stateful one must use interior
-/// mutability (e.g. a `Mutex`/`RwLock`/atomics over just its own state) rather than a
-/// coarse lock over the whole algorithm.
+/// Methods take `self: Arc<Self>`: one algorithm (`Arc<dyn Algorithm>`) is shared across
+/// requests and run concurrently, so it owns its thread-safety. Stateless algorithms
+/// (the reference routers) get this for free; a stateful one uses interior mutability
+/// over just its own state.
 #[async_trait]
 pub trait Algorithm: Send + Sync + 'static {
-    /// Run one request to completion: make the model calls the algorithm decides on
-    /// (via [`Driver::call_llm_target`] / [`Driver::call_llm`]), publish decisions with
-    /// [`Driver::info`], and return the final response. Takes `self: Arc<Self>` so the
-    /// provided [`run_stream`](Self::run_stream) can drive it on its own task, plus
-    /// this call's [`Driver`] — offload every model call and decision on it. `ctx`
-    /// carries any cross-cutting request state.
+    /// Run one request to completion: make model calls with [`Driver::call_llm_target`],
+    /// publish [`Decision`]s with [`Driver::info`], and return the final [`Response`].
+    /// The method an algorithm implements; [`run`](Self::run) / [`run_stream`](Self::run_stream)
+    /// drive it. `ctx` carries cross-cutting request state (empty today).
     async fn create_run_task(
         self: Arc<Self>,
         ctx: Context,
@@ -451,13 +434,12 @@ pub trait Algorithm: Send + Sync + 'static {
         signals: Signals,
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
 
-    /// Run one request as a stream of [`Step`]s. Provided: build a fresh [`Driver`]
-    /// for this call, spawn [`create_run_task`](Self::create_run_task) on its
-    /// own task (handing it a producer-side clone of the driver), and emit the terminal
-    /// step when the task finishes. Because each call builds its own driver, many
-    /// `run_stream`/`run` calls run in parallel with no shared step channel
-    /// — even when they share a `ctx`. Returns a boxed stream so `Arc<dyn Algorithm>`
-    /// stays object-safe.
+    /// Run one request as a stream of [`Step`]s (provided). The algorithm runs on its
+    /// own task; drive the stream: serve each [`Step::CallLlm`] (via its
+    /// [`default_client`](RoutedRequest::default_client) or your own transport) and read
+    /// [`Step::Decision`]s until the final [`Step::ReturnToAgent`]. The step channel is
+    /// bounded, so pulling paces the algorithm; each call is independent, so many run
+    /// concurrently.
     fn run_stream(self: Arc<Self>, ctx: Context, request: Request) -> StepStream {
         // This call's own driver: take its consumer stream, hand a producer-side clone to
         // the algorithm task, and keep one to emit the terminal step. The task blocks
@@ -602,7 +584,7 @@ mod tests {
         }
     }
 
-    /// `(name, has_client)` — a client-less target offloads via a promise.
+    /// `(name, has_client)` — `has_client: false` builds a target with no default client.
     fn target_set(names: &[(&str, bool)]) -> LlmTargetSet {
         let targets = names
             .iter()
