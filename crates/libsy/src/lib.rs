@@ -13,12 +13,12 @@
 //! ## The model
 //!
 //! - An [`Algorithm`] is the optimization *algorithm*. Its
-//!   [`process_request_task`](Algorithm::process_request_task) runs once per request
-//!   and makes as many model calls as it needs — via [`SyDriver::call_target`], which look
-//!   like ordinary calls — publishes its [`Decision`]s with [`SyDriver::info`], and
+//!   [`create_run_task`](Algorithm::create_run_task) runs once per request
+//!   and makes as many model calls as it needs — via [`Driver::call_llm_target`], which look
+//!   like ordinary calls — publishes its [`Decision`]s with [`Driver::info`], and
 //!   returns the final [`Response`]. The provided
-//!   [`stream_steps`](Algorithm::stream_steps) drives that on its own task and hands
-//!   back a stream of [`Step`]s; [`process_request`](Algorithm::process_request) runs
+//!   [`run_stream`](Algorithm::run_stream) drives that on its own task and hands
+//!   back a stream of [`Step`]s; [`run`](Algorithm::run) runs
 //!   it to completion with the targets' default clients.
 //! - An [`LlmTarget`] names a routing target by its [`semantic_name`](LlmTarget::semantic_name).
 //!   Every call is *offloaded* to the request's stream as a [`Step::CallLlm`]; the
@@ -30,11 +30,11 @@
 //!
 //! Hold the algorithm as `Arc<dyn Algorithm>` and call one of two provided methods:
 //!
-//! - [`process_request`](Algorithm::process_request) — run to completion, serving each
+//! - [`run`](Algorithm::run) — run to completion, serving each
 //!   offloaded call via its [`RoutedRequest::default_client`], and return the decision
 //!   trace plus the final [`Response`]. The simplest integration; use it when the
 //!   algorithm holds the model clients (it errors if a routed target has no client).
-//! - [`stream_steps`](Algorithm::stream_steps) — return a stream of [`Step`]s. Each
+//! - [`run_stream`](Algorithm::run_stream) — return a stream of [`Step`]s. Each
 //!   model call is offloaded: the stream yields a [`Step::CallLlm`] carrying a promise;
 //!   the host performs the real model call (optionally via the promise's
 //!   `default_client`) and fulfills it with [`CallLlmRequest::respond`]. Decisions
@@ -45,9 +45,9 @@
 //!
 //! ## Concurrency
 //!
-//! [`Algorithm::process_request_task`] takes `self: Arc<Self>`, so one shared
+//! [`Algorithm::create_run_task`] takes `self: Arc<Self>`, so one shared
 //! `Arc<dyn Algorithm>` (no lock) serves many requests in parallel. Each
-//! [`stream_steps`](Algorithm::stream_steps) call builds its own [`SyDriver`], so
+//! [`run_stream`](Algorithm::run_stream) call builds its own [`Driver`], so
 //! offloaded calls never cross between concurrent requests. An algorithm is
 //! responsible for its own thread-safety — stateless (like the reference routers) or
 //! interior mutability over just its own state.
@@ -72,13 +72,14 @@ use std::{error::Error, pin::Pin, sync::Arc};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 
-use crate::driver::{Driver, DriverRequest, DriverStep};
+pub use crate::driver::Driver;
+use crate::driver::DriverRequest;
 
 /// Shorthand for the crate's boxed, thread-safe error type.
 type BoxErr = Box<dyn Error + Send + Sync>;
 
 /// A boxed, `Send` stream of [`Step`]s — the output of
-/// [`Algorithm::stream_steps`]. Boxed so the trait method that produces it keeps
+/// [`Algorithm::run_stream`]. Boxed so the trait method that produces it keeps
 /// `Arc<dyn Algorithm>` object-safe.
 pub type StepStream = Pin<Box<dyn Stream<Item = Result<Step, BoxErr>> + Send>>;
 
@@ -198,7 +199,7 @@ pub struct RoutedRequest {
 /// routed request ([`get_routed`](Self::get_routed)) and the decision behind it
 /// ([`get_decision`](Self::get_decision)), performs (or delegates) the model call, and
 /// fulfills it with [`respond`](Self::respond) — unblocking the algorithm's
-/// [`SyDriver::call_model`] on the other side.
+/// [`Driver::call_llm`] on the other side.
 pub struct CallLlmRequest {
     inner: DriverRequest,
 }
@@ -235,101 +236,12 @@ impl CallLlmRequest {
     }
 }
 
-/// A libsy-typed request pump built on the generic [`Driver`](crate::driver::Driver).
-///
-/// Specializes the type-erased [`Driver`] to libsy's request vocabulary:
-/// [`call_model`](Self::call_model) offloads a [`RoutedRequest`] and awaits a
-/// [`Response`]; [`info`](Self::info) publishes a [`Decision`];
-/// [`finish`](Self::finish) emits the terminal [`Response`]; and
-/// [`stream`](Self::stream) transforms the native driver stream into a stream of
-/// [`Step`]s. The underlying step channel is bounded (capacity 1), so the stream
-/// consumer paces the algorithm one step at a time. Cloning shares the same channel
-/// (the producer side): [`stream_steps`](Algorithm::stream_steps) takes the consumer
-/// stream, then hands a clone to the algorithm task to publish on.
-#[derive(Clone)]
-pub struct SyDriver {
-    driver: Driver,
-}
-
-impl SyDriver {
-    /// Build an empty driver with its step channel ready.
-    pub fn new() -> Self {
-        Self {
-            driver: Driver::new(),
-        }
-    }
-
-    /// Offload a model call: publish `routed` as a [`Step::CallLlm`] and await the
-    /// consumer's [`Response`]. Errors if the stream is closed or the call failed.
-    pub async fn call_model(&self, routed: RoutedRequest) -> Result<Response, BoxErr> {
-        self.driver
-            .fulfill_request::<RoutedRequest, Response>(routed)
-            .await
-    }
-
-    /// Offload a call to `target`: pair `request` with `decision` and the target's
-    /// default client into a [`RoutedRequest`], then publish it (see
-    /// [`call_model`](Self::call_model)). The convenience most algorithms use;
-    /// `decision.selected_model()` names the model to hit, and `request`'s
-    /// `inbound_model_name` is left untouched.
-    pub async fn call_target(
-        &self,
-        target: &LlmTarget,
-        request: Request,
-        decision: Arc<dyn Decision>,
-    ) -> Result<Response, BoxErr> {
-        self.call_model(RoutedRequest {
-            request,
-            decision,
-            default_client: target.llm_client.clone(),
-        })
-        .await
-    }
-
-    /// Publish a routing [`Decision`] as a [`Step::Decision`] on the stream.
-    pub async fn info(&self, decision: Arc<dyn Decision>) -> Result<(), BoxErr> {
-        self.driver.info(decision).await
-    }
-
-    /// Emit the terminal step: [`Step::ReturnToAgent`] on `Ok`, or an `Err` stream
-    /// item on failure. Called once when the algorithm finishes.
-    pub async fn finish(&self, result: Result<Response, BoxErr>) -> Result<(), BoxErr> {
-        match result {
-            Ok(response) => self.driver.done(response).await,
-            Err(err) => self.driver.fail(err).await,
-        }
-    }
-
-    /// Transform the native [`Driver`] stream into a stream of [`Step`]s. Callable
-    /// once (the underlying receiver is taken once). A payload that does not match the
-    /// expected type for its step becomes an `Err` item.
-    pub fn stream(&self) -> impl Stream<Item = Result<Step, BoxErr>> {
-        self.driver.stream().map(|item| match item? {
-            DriverStep::Request(req) => Ok(Step::CallLlm(CallLlmRequest::new(req))),
-            DriverStep::Info(payload) => payload
-                .downcast::<Arc<dyn Decision>>()
-                .map(|decision| Step::Decision(*decision))
-                .map_err(|_| "sydriver: info payload was not a Decision".into()),
-            DriverStep::Done(payload) => payload
-                .downcast::<Response>()
-                .map(|response| Step::ReturnToAgent(*response))
-                .map_err(|_| "sydriver: done payload was not a Response".into()),
-        })
-    }
-}
-
-impl Default for SyDriver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Per-request state threaded to an algorithm alongside its [`SyDriver`].
+/// Per-request state threaded to an algorithm alongside its [`Driver`].
 ///
 /// A placeholder for cross-cutting request state — correlation ids, budgets,
 /// deadlines, cancellation — that algorithms will read as the enum grows. It does
 /// *not* carry the offload driver: that is created per call by
-/// [`stream_steps`](Algorithm::stream_steps) and passed separately, so sharing a
+/// [`run_stream`](Algorithm::run_stream) and passed separately, so sharing a
 /// `Context` across concurrent requests is safe.
 #[derive(Clone, Default)]
 pub struct Context {}
@@ -341,13 +253,13 @@ impl Context {
     }
 }
 
-/// One item in the stream returned by [`SyDriver::stream`] / [`Algorithm::stream_steps`].
+/// One item in the stream returned by [`Driver::stream`] / [`Algorithm::run_stream`].
 pub enum Step {
     /// The algorithm needs this model call performed. The host serves it (optionally
     /// via [`RoutedRequest::default_client`]) and fulfills it with
     /// [`CallLlmRequest::respond`].
     CallLlm(CallLlmRequest),
-    /// A routing decision the algorithm made, published via [`SyDriver::info`] as it
+    /// A routing decision the algorithm made, published via [`Driver::info`] as it
     /// happens (rather than collected into a trace returned at the end).
     Decision(Arc<dyn Decision>),
     /// The algorithm finished with its final response — the last step of a run.
@@ -357,7 +269,7 @@ pub enum Step {
 /// Performs the actual model call for a target. This is the one piece of I/O
 /// `libsy` does not own — a host implements it over its own transport (HTTP SDK,
 /// in-process model, mock). It serves a call the stream consumer chose not to
-/// override, reached as [`RoutedRequest::default_client`] (see [`Algorithm::stream_steps`]).
+/// override, reached as [`RoutedRequest::default_client`] (see [`Algorithm::run_stream`]).
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// Serve `routed`, returning the model's response. Call the model named by
@@ -388,7 +300,7 @@ pub struct LlmTarget {
 impl LlmTarget {
     /// Whether this target can serve its own call (has a client). Used by
     /// [`LlmTargetSet::all_have_clients`] to decide if every call has a default client
-    /// (so [`Algorithm::process_request`] can serve them all).
+    /// (so [`Algorithm::run`] can serve them all).
     pub fn has_client(&self) -> bool {
         self.llm_client.is_some()
     }
@@ -423,19 +335,19 @@ impl LlmTargetSet {
     }
 
     /// Whether every target can serve its own call — i.e. every offloaded call has a
-    /// [`RoutedRequest::default_client`], so [`Algorithm::process_request`] can serve
+    /// [`RoutedRequest::default_client`], so [`Algorithm::run`] can serve
     /// them all without the host driving the stream.
     pub fn all_have_clients(&self) -> bool {
         self.targets.iter().all(|t| t.has_client())
     }
 }
 
-/// A stateful optimization algorithm. `process_request_task` runs once per request;
-/// inside it the algorithm makes as many `SyDriver::call_target`s as it needs (all
-/// offloaded to the request's stream via [`SyDriver::call_model`]), publishes its
-/// decisions with [`SyDriver::info`], and returns the final response. The provided
-/// [`stream_steps`](Algorithm::stream_steps) drives that task on its own task and
-/// hands back the [`Step`] stream; [`process_request`](Algorithm::process_request)
+/// A stateful optimization algorithm. `create_run_task` runs once per request;
+/// inside it the algorithm makes as many `Driver::call_llm_target`s as it needs (all
+/// offloaded to the request's stream via [`Driver::call_llm`]), publishes its
+/// decisions with [`Driver::info`], and returns the final response. The provided
+/// [`run_stream`](Algorithm::run_stream) drives that task on its own task and
+/// hands back the [`Step`] stream; [`run`](Algorithm::run)
 /// runs it to completion with the targets' default clients.
 ///
 /// Methods take `self: Arc<Self>` / `&self`, not `&mut self`: the orchestrator shares
@@ -447,45 +359,47 @@ impl LlmTargetSet {
 #[async_trait]
 pub trait Algorithm: Send + Sync + 'static {
     /// Run one request to completion: make the model calls the algorithm decides on
-    /// (via [`SyDriver::call_target`] / [`SyDriver::call_model`]), publish decisions with
-    /// [`SyDriver::info`], and return the final response. Takes `self: Arc<Self>` so the
-    /// provided [`stream_steps`](Self::stream_steps) can drive it on its own task, plus
-    /// this call's [`SyDriver`] — offload every model call and decision on it. `ctx`
+    /// (via [`Driver::call_llm_target`] / [`Driver::call_llm`]), publish decisions with
+    /// [`Driver::info`], and return the final response. Takes `self: Arc<Self>` so the
+    /// provided [`run_stream`](Self::run_stream) can drive it on its own task, plus
+    /// this call's [`Driver`] — offload every model call and decision on it. `ctx`
     /// carries any cross-cutting request state.
-    async fn process_request_task(
+    async fn create_run_task(
         self: Arc<Self>,
         ctx: Context,
-        driver: SyDriver,
+        driver: Driver,
         request: Request,
     ) -> Result<Response, Box<dyn Error + Send + Sync>>;
 
     /// Feed the algorithm agentic-stack events (tool results, budgets, etc.). The
     /// reference algorithms ignore signals; a stateful algorithm updates its own
-    /// (interior-mutable) state.
-    async fn process_signals(&self, signals: Signals) -> Result<(), Box<dyn Error + Send + Sync>>;
+    /// (interior-mutable) state. Takes `self: Arc<Self>` like the other run methods.
+    async fn process_signals(
+        self: Arc<Self>,
+        signals: Signals,
+    ) -> Result<(), Box<dyn Error + Send + Sync>>;
 
-    /// The target set this algorithm routes among, if it has one. Lets a host (or
-    /// the orchestrator) introspect the candidate models — e.g. to check that every
-    /// target can serve its own call before running [`process_request`](Self::process_request).
-    fn get_target_set(&self) -> &LlmTargetSet;
+    /// The target set this algorithm routes among, returned as an owned clone. Lets a
+    /// host introspect the candidate models — e.g. to check that every target can serve
+    /// its own call before running [`run`](Self::run). Takes `self: Arc<Self>` for
+    /// consistency (so it cannot borrow from `self`, hence the clone).
+    fn get_target_set(self: Arc<Self>) -> LlmTargetSet;
 
-    /// Run one request as a stream of [`Step`]s. Provided: build a fresh [`SyDriver`]
-    /// for this call, spawn [`process_request_task`](Self::process_request_task) on its
+    /// Run one request as a stream of [`Step`]s. Provided: build a fresh [`Driver`]
+    /// for this call, spawn [`create_run_task`](Self::create_run_task) on its
     /// own task (handing it a producer-side clone of the driver), and emit the terminal
     /// step when the task finishes. Because each call builds its own driver, many
-    /// `stream_steps`/`process_request` calls run in parallel with no shared step channel
+    /// `run_stream`/`run` calls run in parallel with no shared step channel
     /// — even when they share a `ctx`. Returns a boxed stream so `Arc<dyn Algorithm>`
     /// stays object-safe.
-    fn stream_steps(self: Arc<Self>, ctx: Context, request: Request) -> StepStream {
+    fn run_stream(self: Arc<Self>, ctx: Context, request: Request) -> StepStream {
         // This call's own driver: take its consumer stream, hand a producer-side clone to
         // the algorithm task, and keep one to emit the terminal step. The task blocks
         // publishing a step until the consumer pulls the previous one.
-        let driver = SyDriver::new();
+        let driver = Driver::new();
         let stream = driver.stream();
         tokio::spawn(async move {
-            let outcome = self
-                .process_request_task(ctx, driver.clone(), request)
-                .await;
+            let outcome = self.create_run_task(ctx, driver.clone(), request).await;
             let _ = driver.finish(outcome).await;
         });
         Box::pin(stream)
@@ -493,17 +407,17 @@ pub trait Algorithm: Send + Sync + 'static {
 
     /// Run one request to completion, serving each offloaded call with its
     /// [`RoutedRequest::default_client`], and return the decision trace plus the final
-    /// [`Response`]. Provided: drives [`stream_steps`](Self::stream_steps) internally,
+    /// [`Response`]. Provided: drives [`run_stream`](Self::run_stream) internally,
     /// collecting each [`Step::Decision`]. Use it when the algorithm holds its own model
     /// clients and the host wants the answer (and the decisions behind it); drive
-    /// [`stream_steps`](Self::stream_steps) instead to serve the calls yourself. Errors
+    /// [`run_stream`](Self::run_stream) instead to serve the calls yourself. Errors
     /// if a routed target has no client to serve its call, or the algorithm fails.
-    async fn process_request(
+    async fn run(
         self: Arc<Self>,
         ctx: Context,
         request: Request,
     ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
-        let stream = self.stream_steps(ctx, request);
+        let stream = self.run_stream(ctx, request);
         tokio::pin!(stream);
         let mut trace: Vec<Arc<dyn Decision>> = Vec::new();
         while let Some(item) = stream.next().await {
@@ -514,7 +428,7 @@ pub trait Algorithm: Send + Sync + 'static {
                     let routed = call.get_routed()?.clone();
                     let client = routed.default_client.clone().ok_or_else(|| {
                         format!(
-                            "process_request: target '{}' has no client to serve the call",
+                            "run: target '{}' has no client to serve the call",
                             routed.decision.selected_model()
                         )
                     })?;
@@ -526,7 +440,7 @@ pub trait Algorithm: Send + Sync + 'static {
                 Step::ReturnToAgent(response) => return Ok((trace, response)),
             }
         }
-        Err("process_request: stream ended without a final response".into())
+        Err("run: stream ended without a final response".into())
     }
 }
 
@@ -579,10 +493,10 @@ mod tests {
 
     #[async_trait]
     impl Algorithm for TestAlgo {
-        async fn process_request_task(
+        async fn create_run_task(
             self: Arc<Self>,
             _ctx: Context,
-            driver: SyDriver,
+            driver: Driver,
             request: Request,
         ) -> Result<Response, Box<dyn Error + Send + Sync>> {
             let target = self
@@ -595,18 +509,18 @@ mod tests {
                 model: target.semantic_name.clone(),
             });
             driver.info(decision.clone()).await?;
-            driver.call_target(&target, request, decision).await
+            driver.call_llm_target(&target, request, decision).await
         }
 
         async fn process_signals(
-            &self,
+            self: Arc<Self>,
             _signals: Signals,
         ) -> Result<(), Box<dyn Error + Send + Sync>> {
             Ok(())
         }
 
-        fn get_target_set(&self) -> &LlmTargetSet {
-            &self.target_set
+        fn get_target_set(self: Arc<Self>) -> LlmTargetSet {
+            self.target_set.clone()
         }
     }
 
@@ -643,8 +557,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // A client-less target -> its call is offloaded via a promise the
         // orchestrator surfaces as a `CallLlm` step for us to fulfill.
-        let stream = orch(target_set(&[("offload/model", false)]))
-            .stream_steps(Context::default(), request());
+        let stream =
+            orch(target_set(&[("offload/model", false)])).run_stream(Context::default(), request());
         tokio::pin!(stream);
 
         let mut saw_call = false;
@@ -687,7 +601,7 @@ mod tests {
         // Every call now offloads to the stream; a client-backed target rides its
         // client along as `default_client` so the consumer can serve it by default.
         let stream =
-            orch(target_set(&[("direct/model", true)])).stream_steps(Context::default(), request());
+            orch(target_set(&[("direct/model", true)])).run_stream(Context::default(), request());
         tokio::pin!(stream);
 
         let mut final_completion = None;
@@ -715,12 +629,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_request_returns_the_response_when_all_targets_have_clients(
+    async fn run_returns_the_response_when_all_targets_have_clients(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Every target has a client, so process_request serves every call via the
+        // Every target has a client, so run serves every call via the
         // default client and returns the trace + final response.
         let (trace, response) = orch(target_set(&[("direct/model", true)]))
-            .process_request(Context::default(), request())
+            .run(Context::default(), request())
             .await?;
         // TestAlgo calls the first target; EchoClient echoes its name.
         assert_eq!(response.llm_response.completion, "direct/model");
@@ -729,12 +643,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_request_errors_when_a_target_lacks_a_client(
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn run_errors_when_a_target_lacks_a_client() -> Result<(), Box<dyn Error + Send + Sync>> {
         // A client-less target has no default client to serve its offloaded call, so
         // driving it to completion errors.
         assert!(orch(target_set(&[("offload/model", false)]))
-            .process_request(Context::default(), request())
+            .run(Context::default(), request())
             .await
             .is_err());
         Ok(())
@@ -787,7 +700,7 @@ mod tests {
         for _ in 0..N {
             let algo = algo.clone();
             handles.push(tokio::spawn(async move {
-                algo.process_request(Context::default(), request())
+                algo.run(Context::default(), request())
                     .await
                     .map(|(_, response)| response.llm_response.completion)
             }));
@@ -805,10 +718,10 @@ mod tests {
     async fn offload_error_propagates_back_to_the_algorithm(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // A client-less target offloads its call; we fulfill the promise with an
-        // Err, which must flow back through `call_target` into the algorithm and
+        // Err, which must flow back through `call_llm_target` into the algorithm and
         // out as an error step — not a response.
-        let stream = orch(target_set(&[("offload/model", false)]))
-            .stream_steps(Context::default(), request());
+        let stream =
+            orch(target_set(&[("offload/model", false)])).run_stream(Context::default(), request());
         tokio::pin!(stream);
 
         let mut saw_error = false;
@@ -822,7 +735,7 @@ mod tests {
                     return Err("expected the offload error to propagate, got a response".into());
                 }
                 Err(err) => {
-                    // The algorithm's `call_target` saw the error via the promise.
+                    // The algorithm's `call_llm_target` saw the error via the promise.
                     assert!(err.to_string().contains("upstream model call failed"));
                     saw_error = true;
                 }

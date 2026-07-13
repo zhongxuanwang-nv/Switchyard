@@ -5,8 +5,8 @@
 //!
 //! Unlike a local ML classifier (which scores a prompt in-process), an LLM
 //! classifier needs its own model call to classify the request. On the new
-//! interfaces this is just two ordinary `driver.call_target`s inside one
-//! `process_request_task`: first the classifier target (to get a score), then the
+//! interfaces this is just two ordinary `driver.call_llm_target`s inside one
+//! `create_run_task`: first the classifier target (to get a score), then the
 //! routed strong/weak target. The multi-step nature is invisible to the caller —
 //! it is the algorithm's own control flow.
 
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::{
-    Algorithm, Context, Decision, LlmRequest, LlmTargetSet, Request, Response, Signals, SyDriver,
+    Algorithm, Context, Decision, Driver, LlmRequest, LlmTargetSet, Request, Response, Signals,
 };
 
 /// Preamble prepended to the user prompt when asking the classifier target for a
@@ -99,10 +99,10 @@ impl LlmClassifierOrchAlgo {
 
 #[async_trait]
 impl Algorithm for LlmClassifierOrchAlgo {
-    async fn process_request_task(
+    async fn create_run_task(
         self: Arc<Self>,
         _ctx: Context,
-        driver: SyDriver,
+        driver: Driver,
         request: Request,
     ) -> Result<Response, Box<dyn Error + Send + Sync>> {
         let user_prompt = request.llm_request.prompt.clone();
@@ -128,7 +128,7 @@ impl Algorithm for LlmClassifierOrchAlgo {
         });
         driver.info(classify_decision.clone()).await?;
         let classify_response = driver
-            .call_target(&classifier_target, classify_request, classify_decision)
+            .call_llm_target(&classifier_target, classify_request, classify_decision)
             .await?;
         let score = classify_response
             .llm_response
@@ -164,17 +164,20 @@ impl Algorithm for LlmClassifierOrchAlgo {
         };
         driver.info(route_decision.clone()).await?;
         driver
-            .call_target(&routed_target, routed_request, route_decision)
+            .call_llm_target(&routed_target, routed_request, route_decision)
             .await
     }
 
-    async fn process_signals(&self, _signals: Signals) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn process_signals(
+        self: Arc<Self>,
+        _signals: Signals,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Stateless classification; agent-system signals are ignored.
         Ok(())
     }
 
-    fn get_target_set(&self) -> &LlmTargetSet {
-        &self.target_set
+    fn get_target_set(self: Arc<Self>) -> LlmTargetSet {
+        self.target_set.clone()
     }
 }
 
@@ -276,7 +279,7 @@ mod tests {
     {
         let (algo, _) = algo(0.5, "0.9");
         let (trace, response) = orch(algo)
-            .process_request(Context::default(), request("solve this proof"))
+            .run(Context::default(), request("solve this proof"))
             .await?;
         assert_eq!(
             response.llm_response.completion,
@@ -295,7 +298,7 @@ mod tests {
     async fn score_below_threshold_routes_weak() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (algo, _) = algo(0.5, "0.2");
         let (trace, response) = orch(algo)
-            .process_request(Context::default(), request("say hello"))
+            .run(Context::default(), request("say hello"))
             .await?;
         assert_eq!(response.llm_response.completion, "answer from cheap/model");
         let routed = as_classifier(&trace[1])?;
@@ -309,7 +312,7 @@ mod tests {
     {
         let (algo, _) = algo(0.5, "0.5");
         let (_, response) = orch(algo)
-            .process_request(Context::default(), request("borderline"))
+            .run(Context::default(), request("borderline"))
             .await?;
         assert_eq!(
             response.llm_response.completion,
@@ -321,9 +324,7 @@ mod tests {
     #[tokio::test]
     async fn unparseable_score_defaults_to_strong() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (algo, _) = algo(0.5, "not-a-number");
-        let (trace, response) = orch(algo)
-            .process_request(Context::default(), request("hi"))
-            .await?;
+        let (trace, response) = orch(algo).run(Context::default(), request("hi")).await?;
         assert_eq!(
             response.llm_response.completion,
             "answer from frontier/model"
@@ -339,7 +340,7 @@ mod tests {
     {
         let (algo, seen) = algo(0.5, "0.9");
         orch(algo)
-            .process_request(Context::default(), request("prove it"))
+            .run(Context::default(), request("prove it"))
             .await?;
         let seen = seen.lock().map_err(|_| "lock poisoned")?;
         // Two calls: the classifier (preamble + user text), then the routed model.

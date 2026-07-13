@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Minimal research agent using the [`Algorithm::process_request`] convenience.
+//! Minimal research agent using the [`Algorithm::run`] convenience.
 //!
 //! Every target owns an `LlmClient`, so the agent runs each request to completion with
-//! [`Algorithm::process_request`]: it serves each offloaded call with the routed
+//! [`Algorithm::run`]: it serves each offloaded call with the routed
 //! target's `default_client` and returns the final response — no stream to drive. The
 //! multi-step routing (classify -> route) happens inside the classifier algorithm; the
 //! agent never sees it. To drive the step stream yourself instead, use
-//! `Algorithm::stream_steps`. Run with:
+//! `Algorithm::run_stream`. Run with:
 //!   cargo run -p libsy --example research_agent
 
 use std::error::Error;
@@ -81,11 +81,7 @@ impl ResearchAgent {
                 metadata: None,
             };
 
-            let (_trace, response) = self
-                .algo
-                .clone()
-                .process_request(Context::default(), request)
-                .await?;
+            let (_trace, response) = self.algo.clone().run(Context::default(), request).await?;
             notes.push(response.llm_response.completion);
         }
         Ok(notes.join("\n"))

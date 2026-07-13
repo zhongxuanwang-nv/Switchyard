@@ -1,26 +1,34 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! # driver — a promise-over-a-stream request pump
+//! # driver — promise-over-a-stream request pumps
 //!
-//! A [`Driver`] lets a *producer* (e.g. an [`Algorithm`](crate::Algorithm)) fulfill
+//! Two layers live here: [`TypeErasedDriver`] is the generic primitive, and [`Driver`]
+//! is the libsy-typed pump built on it. [`Driver`] fixes the request/response types to
+//! libsy's ([`call_llm`](Driver::call_llm) / [`call_llm_target`](Driver::call_llm_target)
+//! offload a call and await a [`Response`](crate::Response), [`info`](Driver::info)
+//! publishes a [`Decision`](crate::Decision), [`finish`](Driver::finish) emits the
+//! terminal response) and maps the raw steps to libsy [`Step`](crate::Step)s
+//! ([`stream`](Driver::stream)). The rest of this doc describes the primitive.
+//!
+//! A [`TypeErasedDriver`] lets a *producer* (e.g. an [`Algorithm`](crate::Algorithm)) fulfill
 //! arbitrary requests by publishing promises onto a stream that a single *consumer*
 //! drains. It is the type-erased generalization of the offload mechanism in
-//! [`Algorithm::stream_steps`](crate::Algorithm::stream_steps): instead of one fixed
-//! request/response shape, a producer calls [`fulfill_request`](Driver::fulfill_request)
+//! [`Algorithm::run_stream`](crate::Algorithm::run_stream): instead of one fixed
+//! request/response shape, a producer calls [`fulfill_request`](TypeErasedDriver::fulfill_request)
 //! with *any* `REQ` and awaits *any* `RES`.
 //!
-//! - [`fulfill_request`](Driver::fulfill_request) enqueues a [`DriverStep::Request`]
+//! - [`fulfill_request`](TypeErasedDriver::fulfill_request) enqueues a [`DriverStep::Request`]
 //!   carrying a [`DriverRequest`], then awaits the consumer's response.
-//! - [`info`](Driver::info) pushes a fire-and-forget [`DriverStep::Info`] — no promise
+//! - [`info`](TypeErasedDriver::info) pushes a fire-and-forget [`DriverStep::Info`] — no promise
 //!   to await.
-//! - [`done`](Driver::done) emits the terminal [`DriverStep::Done`] with a final payload.
-//! - [`stream`](Driver::stream) hands the single consumer the [`Stream`] of steps; for
+//! - [`done`](TypeErasedDriver::done) emits the terminal [`DriverStep::Done`] with a final payload.
+//! - [`stream`](TypeErasedDriver::stream) hands the single consumer the [`Stream`] of steps; for
 //!   each [`DriverStep::Request`] the consumer downcasts the request, computes a
 //!   response, and writes it back with [`DriverRequest::respond`].
 //!
-//! Payloads are erased to `Box<dyn Any + Send>`, so one `Driver` serves any request
-//! type; the consumer downcasts to the concrete type it expects. `Driver` is `Clone`
+//! Payloads are erased to `Box<dyn Any + Send>`, so one `TypeErasedDriver` serves any request
+//! type; the consumer downcasts to the concrete type it expects. `TypeErasedDriver` is `Clone`
 //! (many producer tasks may call it concurrently — multi-producer), while the stream
 //! is single-consumer. Each request rides its own `oneshot`, so concurrent
 //! `fulfill_request` calls never cross responses.
@@ -38,9 +46,9 @@
 //! stream** (and any [`DriverRequest`] it is holding). The producer's next publish
 //! (`fulfill_request`/`info`/`done`/`fail`) then resolves to `Err`, and a producer
 //! awaiting a response sees `Err` once the promise it handed out is dropped. Either
-//! way the algorithm unwinds cooperatively at its next Driver interaction. Because the
-//! producer runs on a task the Driver does not own, hard cancellation (e.g. mid-compute
-//! that never touches the Driver) is the caller's concern — abort the producer task.
+//! way the algorithm unwinds cooperatively at its next driver interaction. Because the
+//! producer runs on a task the driver does not own, hard cancellation (e.g. mid-compute
+//! that never touches the driver) is the caller's concern — abort the producer task.
 
 use std::{
     any::Any,
@@ -52,11 +60,13 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::{CallLlmRequest, Decision, LlmTarget, Request, Response, RoutedRequest, Step};
+
 type BoxErr = Box<dyn Error + Send + Sync>;
 type BoxAny = Box<dyn Any + Send>;
 type StepResult = Result<DriverStep, BoxErr>;
 
-/// One item on the stream returned by [`Driver::stream`].
+/// One item on the stream returned by [`TypeErasedDriver::stream`].
 pub enum DriverStep {
     /// A request awaiting a response. The consumer downcasts it and fulfills the
     /// paired promise with [`DriverRequest::respond`].
@@ -64,11 +74,11 @@ pub enum DriverStep {
     /// A fire-and-forget payload from a producer; no response is expected.
     Info(BoxAny),
     /// A producer's terminal result. The consumer treats it as the last meaningful
-    /// step (the stream itself closes when every [`Driver`] clone drops).
+    /// step (the stream itself closes when every [`TypeErasedDriver`] clone drops).
     Done(BoxAny),
 }
 
-/// The consumer-facing half of one [`Driver::fulfill_request`] call.
+/// The consumer-facing half of one [`TypeErasedDriver::fulfill_request`] call.
 ///
 /// Yielded inside [`DriverStep::Request`]. The consumer reads the request via
 /// [`request`](Self::request), does whatever work it names, and fulfills the promise
@@ -102,7 +112,7 @@ impl DriverRequest {
 
 /// Internal shared state: the step channel plus the single, take-once receiver.
 struct DriverInner {
-    // Multi-producer: cloned into every `Driver`, so many tasks can enqueue steps.
+    // Multi-producer: cloned into every `TypeErasedDriver`, so many tasks can enqueue steps.
     // Capacity 1: a producer blocks publishing its next step until the consumer pulls
     // the previous one, so the consumer paces the algorithm.
     step_tx: mpsc::Sender<StepResult>,
@@ -115,16 +125,16 @@ struct DriverInner {
 /// Cheap to clone (shares one `Arc`); clone it to hand a producer handle to another
 /// task. The consumer calls [`stream`](Self::stream) exactly once to drain steps.
 #[derive(Clone)]
-pub struct Driver {
+pub struct TypeErasedDriver {
     inner: Arc<DriverInner>,
 }
 
-impl Driver {
+impl TypeErasedDriver {
     /// Build an empty driver with its step channel ready. Take the consumer stream
     /// with [`stream`](Self::stream); enqueue work with the other methods.
     pub fn new() -> Self {
         let (step_tx, step_rx) = mpsc::channel(1);
-        Driver {
+        TypeErasedDriver {
             inner: Arc::new(DriverInner {
                 step_tx,
                 step_rx: Mutex::new(Some(step_rx)),
@@ -178,7 +188,7 @@ impl Driver {
     }
 
     /// Emit the terminal [`DriverStep::Done`] with a final payload. Does not close the
-    /// stream (that happens when every `Driver` clone drops); the consumer treats it
+    /// stream (that happens when every `TypeErasedDriver` clone drops); the consumer treats it
     /// as the last meaningful step. Awaits channel capacity and errors only if the
     /// stream is closed.
     pub async fn done<T>(&self, payload: T) -> Result<(), BoxErr>
@@ -193,7 +203,7 @@ impl Driver {
     }
 
     /// Terminate the stream with an error item — the producer-side way to surface a
-    /// failure to the consumer (mirrors how [`Algorithm::stream_steps`](crate::Algorithm::stream_steps)
+    /// failure to the consumer (mirrors how [`Algorithm::run_stream`](crate::Algorithm::run_stream)
     /// yields an `Err` step). Awaits channel capacity and errors only if the stream is
     /// already closed.
     pub async fn fail(&self, err: BoxErr) -> Result<(), BoxErr> {
@@ -222,6 +232,93 @@ impl Driver {
     }
 }
 
+impl Default for TypeErasedDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The libsy-typed request pump: a [`TypeErasedDriver`] specialized to libsy's request
+/// vocabulary. [`call_llm`](Self::call_llm) / [`call_llm_target`](Self::call_llm_target)
+/// offload a call and await a [`Response`]; [`info`](Self::info) publishes a
+/// [`Decision`]; [`finish`](Self::finish) emits the terminal [`Response`]; and
+/// [`stream`](Self::stream) transforms the raw driver stream into a stream of
+/// [`Step`]s. The underlying step channel is bounded (capacity 1), so the consumer
+/// paces the algorithm one step at a time. Cloning shares the same channel (the
+/// producer side): [`run_stream`](crate::Algorithm::run_stream) takes the consumer
+/// stream, then hands a clone to the algorithm task to publish on.
+#[derive(Clone)]
+pub struct Driver {
+    driver: TypeErasedDriver,
+}
+
+impl Driver {
+    /// Build an empty driver with its step channel ready.
+    pub fn new() -> Self {
+        Self {
+            driver: TypeErasedDriver::new(),
+        }
+    }
+
+    /// Offload a model call: publish `routed` as a [`Step::CallLlm`] and await the
+    /// consumer's [`Response`]. Errors if the stream is closed or the call failed.
+    pub async fn call_llm(&self, routed: RoutedRequest) -> Result<Response, BoxErr> {
+        self.driver
+            .fulfill_request::<RoutedRequest, Response>(routed)
+            .await
+    }
+
+    /// Offload a call to `target`: pair `request` with `decision` and the target's
+    /// default client into a [`RoutedRequest`], then publish it (see
+    /// [`call_llm`](Self::call_llm)). The convenience most algorithms use;
+    /// `decision.selected_model()` names the model to hit, and `request`'s
+    /// `inbound_model_name` is left untouched.
+    pub async fn call_llm_target(
+        &self,
+        target: &LlmTarget,
+        request: Request,
+        decision: Arc<dyn Decision>,
+    ) -> Result<Response, BoxErr> {
+        self.call_llm(RoutedRequest {
+            request,
+            decision,
+            default_client: target.llm_client.clone(),
+        })
+        .await
+    }
+
+    /// Publish a routing [`Decision`] as a [`Step::Decision`] on the stream.
+    pub async fn info(&self, decision: Arc<dyn Decision>) -> Result<(), BoxErr> {
+        self.driver.info(decision).await
+    }
+
+    /// Emit the terminal step: [`Step::ReturnToAgent`] on `Ok`, or an `Err` stream
+    /// item on failure. Called once when the algorithm finishes.
+    pub async fn finish(&self, result: Result<Response, BoxErr>) -> Result<(), BoxErr> {
+        match result {
+            Ok(response) => self.driver.done(response).await,
+            Err(err) => self.driver.fail(err).await,
+        }
+    }
+
+    /// Transform the raw driver stream into a stream of [`Step`]s. Callable once (the
+    /// underlying receiver is taken once). A payload that does not match the expected
+    /// type for its step becomes an `Err` item.
+    pub fn stream(&self) -> impl Stream<Item = Result<Step, BoxErr>> {
+        self.driver.stream().map(|item| match item? {
+            DriverStep::Request(req) => Ok(Step::CallLlm(CallLlmRequest::new(req))),
+            DriverStep::Info(payload) => payload
+                .downcast::<Arc<dyn Decision>>()
+                .map(|decision| Step::Decision(*decision))
+                .map_err(|_| "driver: info payload was not a Decision".into()),
+            DriverStep::Done(payload) => payload
+                .downcast::<Response>()
+                .map(|response| Step::ReturnToAgent(*response))
+                .map_err(|_| "driver: done payload was not a Response".into()),
+        })
+    }
+}
+
 impl Default for Driver {
     fn default() -> Self {
         Self::new()
@@ -235,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn fulfill_request_round_trips_typed_values() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let stream = driver.stream();
 
         // Producer asks for a u32 -> String on its own task.
@@ -259,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn info_pushes_a_typed_payload() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let stream = driver.stream();
         driver.info(42u64).await?;
 
@@ -276,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn done_emits_the_terminal_payload() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let stream = driver.stream();
         driver.done("finished".to_string()).await?;
 
@@ -295,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn respond_error_propagates_to_the_producer() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let stream = driver.stream();
 
         let producer = driver.clone();
@@ -320,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_type_mismatch_errors() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let stream = driver.stream();
 
         // Producer expects a String back.
@@ -348,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_downcast_to_wrong_type_errors() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let stream = driver.stream();
 
         let producer = driver.clone();
@@ -370,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_stream_errors_on_send() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         // Drop the consumer stream (and its receiver) before producing anything.
         drop(driver.stream());
 
@@ -382,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn promise_dropped_without_response_errors() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let stream = driver.stream();
 
         let producer = driver.clone();
@@ -402,7 +499,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_producers_do_not_cross_responses() -> Result<(), BoxErr> {
         const N: usize = 8;
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let stream = driver.stream();
 
         // N producers each fulfill their own request concurrently.
@@ -438,7 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_taken_twice_yields_an_error_item() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let _first = driver.stream();
         let second = driver.stream();
 
@@ -454,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_surfaces_an_error_item_on_the_stream() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         let stream = driver.stream();
         driver.fail("kaboom".into()).await?;
 
@@ -470,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_stream_terminates_the_producer() -> Result<(), BoxErr> {
-        let driver = Driver::new();
+        let driver = TypeErasedDriver::new();
         // Box::pin so the stream is owned here and `drop` actually drops the receiver.
         // (`tokio::pin!` would rebind to a `Pin<&mut _>`, making `drop` a no-op.)
         let mut stream = Box::pin(driver.stream());

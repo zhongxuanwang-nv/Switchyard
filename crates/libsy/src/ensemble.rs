@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::{
-    Algorithm, Context, Decision, LlmRequest, LlmTargetSet, Request, Response, Signals, SyDriver,
+    Algorithm, Context, Decision, Driver, LlmRequest, LlmTargetSet, Request, Response, Signals,
 };
 
 /// Which step of the ensemble flow produced a decision.
@@ -101,8 +101,8 @@ impl EnsembleOrchAlgo {
     /// exploring for `exploration_turns` before committing to the winningest
     /// candidate (`0` = never commit, ensemble every request), routing among
     /// `target_set`. Wrap it in an [`Arc`](std::sync::Arc) and drive it with
-    /// [`process_request`](crate::Algorithm::process_request) or
-    /// [`stream_steps`](crate::Algorithm::stream_steps).
+    /// [`run`](crate::Algorithm::run) or
+    /// [`run_stream`](crate::Algorithm::run_stream).
     pub fn new(
         candidate_models: Vec<String>,
         judge_model: impl Into<String>,
@@ -170,7 +170,7 @@ impl EnsembleOrchAlgo {
     /// Route a request to a single already-chosen model — the committed fast path.
     async fn route_committed(
         &self,
-        driver: &SyDriver,
+        driver: &Driver,
         request: Request,
         model: String,
     ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
@@ -194,7 +194,7 @@ impl EnsembleOrchAlgo {
             metadata: request.metadata,
         };
         let response = driver
-            .call_target(&target, routed, decision.clone())
+            .call_llm_target(&target, routed, decision.clone())
             .await?;
         Ok((vec![decision], response))
     }
@@ -203,7 +203,7 @@ impl EnsembleOrchAlgo {
     /// tally the winner, and return its response.
     async fn ensemble_turn(
         &self,
-        driver: &SyDriver,
+        driver: &Driver,
         request: Request,
     ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
         let user_prompt = request.llm_request.prompt.clone();
@@ -236,7 +236,9 @@ impl EnsembleOrchAlgo {
             calls.push(async move {
                 (
                     model,
-                    driver.call_target(&target, call_request, decision).await,
+                    driver
+                        .call_llm_target(&target, call_request, decision)
+                        .await,
                 )
             });
         }
@@ -278,7 +280,7 @@ impl EnsembleOrchAlgo {
                 metadata: request.metadata.clone(),
             };
             let judge_response = driver
-                .call_target(&judge_target, judge_request, judge_decision.clone())
+                .call_llm_target(&judge_target, judge_request, judge_decision.clone())
                 .await?;
             // Fail open: an unparseable pick falls back to the first response.
             let choice = parse_choice(&judge_response.llm_response.completion, survivors.len());
@@ -359,10 +361,10 @@ fn parse_choice(completion: &str, count: usize) -> usize {
 
 #[async_trait]
 impl Algorithm for EnsembleOrchAlgo {
-    async fn process_request_task(
+    async fn create_run_task(
         self: Arc<Self>,
         _ctx: Context,
-        driver: SyDriver,
+        driver: Driver,
         request: Request,
     ) -> Result<Response, Box<dyn Error + Send + Sync>> {
         // Fast path: exploration is over — route straight to the committed model;
@@ -381,13 +383,16 @@ impl Algorithm for EnsembleOrchAlgo {
         Ok(response)
     }
 
-    async fn process_signals(&self, _signals: Signals) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn process_signals(
+        self: Arc<Self>,
+        _signals: Signals,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Success is measured by the judge, not agent-system signals.
         Ok(())
     }
 
-    fn get_target_set(&self) -> &LlmTargetSet {
-        &self.target_set
+    fn get_target_set(self: Arc<Self>) -> LlmTargetSet {
+        self.target_set.clone()
     }
 }
 
@@ -533,7 +538,7 @@ mod tests {
         // Judge prefers b/model; it should win and be returned.
         let (algo, calls) = algo(&["a/model", "b/model"], "judge/haiku", "b/model", 100);
         let (trace, response) = orch(algo)
-            .process_request(Context::default(), request("solve it"))
+            .run(Context::default(), request("solve it"))
             .await?;
         assert_eq!(response.llm_response.completion, "answer from b/model");
 
@@ -562,12 +567,8 @@ mod tests {
         let orch = orch(algo);
 
         // Two exploration turns.
-        orch.clone()
-            .process_request(Context::default(), request("t1"))
-            .await?;
-        orch.clone()
-            .process_request(Context::default(), request("t2"))
-            .await?;
+        orch.clone().run(Context::default(), request("t1")).await?;
+        orch.clone().run(Context::default(), request("t2")).await?;
         let judge_calls_after_exploration = calls
             .lock()
             .map_err(|_| "lock poisoned")?
@@ -578,10 +579,7 @@ mod tests {
 
         // Third request: committed fast path — routes straight to b/model with no
         // fan-out to a/model and no judge call.
-        let (trace, response) = orch
-            .clone()
-            .process_request(Context::default(), request("t3"))
-            .await?;
+        let (trace, response) = orch.clone().run(Context::default(), request("t3")).await?;
         assert_eq!(response.llm_response.completion, "answer from b/model");
         assert_eq!(trace.len(), 1);
         let decision = as_ensemble(&trace[0])?;
@@ -599,9 +597,7 @@ mod tests {
     #[tokio::test]
     async fn single_candidate_skips_the_judge() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (algo, calls) = algo(&["only/model"], "judge/haiku", "only/model", 100);
-        let (trace, response) = orch(algo)
-            .process_request(Context::default(), request("hi"))
-            .await?;
+        let (trace, response) = orch(algo).run(Context::default(), request("hi")).await?;
         assert_eq!(response.llm_response.completion, "answer from only/model");
         // No judge call for a lone candidate.
         assert!(!calls
@@ -620,10 +616,7 @@ mod tests {
         let (algo, calls) = algo(&["a/model", "b/model"], "judge/haiku", "b/model", 0);
         let orch = orch(algo);
         for _ in 0..3 {
-            let (trace, _) = orch
-                .clone()
-                .process_request(Context::default(), request("x"))
-                .await?;
+            let (trace, _) = orch.clone().run(Context::default(), request("x")).await?;
             // Always a full ensemble turn (never a lone Committed decision).
             assert_eq!(
                 as_ensemble(&trace[trace.len() - 1])?.phase,
@@ -672,7 +665,7 @@ mod tests {
             ]),
         );
         assert!(orch(algo)
-            .process_request(Context::default(), request("x"))
+            .run(Context::default(), request("x"))
             .await
             .is_err());
         Ok(())
@@ -681,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn process_signals_is_a_noop() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (algo, _) = algo(&["a/model"], "judge/haiku", "a/model", 1);
-        algo.process_signals(Signals {}).await?;
+        Arc::new(algo).process_signals(Signals {}).await?;
         Ok(())
     }
 
@@ -764,7 +757,7 @@ mod tests {
         let run = |session: Arc<dyn Algorithm>, prompt: &'static str| {
             tokio::spawn(async move {
                 session
-                    .process_request(Context::default(), request(prompt))
+                    .run(Context::default(), request(prompt))
                     .await
                     .map(|(_, response)| response.llm_response.completion)
             })
@@ -797,15 +790,15 @@ mod tests {
             tokio::spawn(async move {
                 session
                     .clone()
-                    .process_request(Context::default(), request("t1"))
+                    .run(Context::default(), request("t1"))
                     .await?;
                 session
                     .clone()
-                    .process_request(Context::default(), request("t2"))
+                    .run(Context::default(), request("t2"))
                     .await?;
                 let (trace, response) = session
                     .clone()
-                    .process_request(Context::default(), request("t3"))
+                    .run(Context::default(), request("t3"))
                     .await?;
                 let phase = trace
                     .last()

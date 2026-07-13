@@ -3,7 +3,7 @@
 
 //! Research agent driving the raw `run` stream with **client-less** targets.
 //!
-//! With no client, every `driver.call_target` is offloaded as a promise the orchestrator
+//! With no client, every `driver.call_llm_target` is offloaded as a promise the orchestrator
 //! surfaces as a `CallLlm` step. The agent makes the "real" model call itself and
 //! fulfills the promise — this is the offload/streaming path ("ask, don't call").
 //! The classifier's two steps show up as two `model call:` lines. Run with:
@@ -72,7 +72,7 @@ impl ResearchAgent {
                 raw_request: None,
                 metadata: None,
             };
-            let stream = self.algo.clone().stream_steps(Context::default(), request);
+            let stream = self.algo.clone().run_stream(Context::default(), request);
             tokio::pin!(stream);
             while let Some(update) = stream.next().await {
                 match update? {
