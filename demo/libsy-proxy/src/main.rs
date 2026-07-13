@@ -31,8 +31,9 @@ use serde_json::{json, Value};
 
 use libsy::llm_class::{ClassifierDecision, LlmClassifierOrchAlgo};
 use libsy::{
-    DecisionTrace, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet,
-    MultiLlmOrchestrator, OrchestratorRequest, OrchestratorResponse,
+    request_text, response_text, text_request, text_response, Algorithm, Context, Decision,
+    LlmClient, LlmTarget, LlmTargetSet, Request as LibsyRequest, Response as LibsyResponse,
+    RoutedRequest,
 };
 
 use switchyard_components::OpenAiPassthroughBackend;
@@ -41,7 +42,8 @@ use switchyard_core::{
     ChatRequest, ChatResponse, EndpointConfig, LlmBackend, ModelId, ProxyContext, Result,
     SwitchyardError,
 };
-use switchyard_server::{serve_addr, ProfileRegistry, ServerState};
+use switchyard_server::{build_switchyard_router, ProfileRegistry, ServerState};
+use tokio::net::TcpListener;
 
 // Routing configuration (per the demo's inference-hub models).
 const CLASSIFIER_MODEL: &str = "nvidia/deepseek-ai/deepseek-v4-flash";
@@ -65,13 +67,14 @@ struct SwitchyardBackendClient {
 impl LlmClient for SwitchyardBackendClient {
     async fn call(
         &self,
-        request: OrchestratorRequest,
-    ) -> std::result::Result<OrchestratorResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let model = request.llm_request.model_name.clone();
+        routed: RoutedRequest,
+    ) -> std::result::Result<LibsyResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let model = routed.decision.selected_model().to_string();
+        let prompt = request_text(&routed.request.llm_request);
         // Build a single-shot OpenAI chat request for the chosen model.
         let body = json!({
             "model": model,
-            "messages": [{ "role": "user", "content": request.llm_request.prompt }],
+            "messages": [{ "role": "user", "content": prompt }],
             "stream": false,
         });
         let chat_request = ChatRequest::openai_chat(body);
@@ -85,11 +88,8 @@ impl LlmClient for SwitchyardBackendClient {
 
         let raw = response.body().cloned().unwrap_or(Value::Null);
         let completion = completion_text(&raw).unwrap_or_default();
-        Ok(OrchestratorResponse {
-            llm_response: LlmResponse {
-                completion,
-                raw_response: Some(raw),
-            },
+        Ok(LibsyResponse {
+            llm_response: text_response(completion),
             metadata: None,
         })
     }
@@ -99,7 +99,7 @@ impl LlmClient for SwitchyardBackendClient {
 /// classifier. switchyard's router hands us the inbound request and translates
 /// our response back to the caller's format; we only do routing + one upstream call.
 struct LibsyClassifierProfile {
-    orchestrator: MultiLlmOrchestrator,
+    orchestrator: Arc<dyn Algorithm>,
 }
 
 #[async_trait]
@@ -109,11 +109,8 @@ impl Profile for LibsyClassifierProfile {
         let prompt = extract_prompt(input.request.body())
             .ok_or_else(|| SwitchyardError::InvalidRequest("no user prompt in request".into()))?;
 
-        let orch_request = OrchestratorRequest {
-            llm_request: LlmRequest {
-                model_name: "auto".to_string(),
-                prompt,
-            },
+        let orch_request = LibsyRequest {
+            llm_request: text_request(PROFILE_MODEL_ID, prompt),
             raw_request: Some(input.request.body().clone()),
             metadata: None,
         };
@@ -123,21 +120,20 @@ impl Profile for LibsyClassifierProfile {
         // libsy's targets perform those calls via the switchyard backend.
         let (trace, response) = self
             .orchestrator
-            .orchestrate_direct(orch_request)
+            .clone()
+            .run(Context::default(), orch_request)
             .await
             .map_err(|e| SwitchyardError::Other(e.to_string()))?;
 
-        // Return the routed model's response body (OpenAI chat-completion shape);
-        // switchyard reconciles it against the caller's inbound format.
-        let body = response.llm_response.raw_response.unwrap_or_else(|| {
-            json!({
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": response.llm_response.completion },
-                    "finish_reason": "stop",
-                }],
-            })
+        // Return an OpenAI chat-completion body; switchyard reconciles it against
+        // the caller's inbound format.
+        let body = json!({
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": response_text(&response.llm_response) },
+                "finish_reason": "stop",
+            }],
         });
         let chat_response = ChatResponse::openai_completion(body);
         Ok(ProfileResponse::with_routing_metadata(
@@ -193,12 +189,12 @@ fn completion_text(body: &Value) -> Option<String> {
 }
 
 /// Surface libsy's routing decision as `x-model-router-*` response headers.
-fn routing_metadata(trace: &[Arc<dyn DecisionTrace>]) -> RoutingMetadata {
+fn routing_metadata(trace: &[Arc<dyn Decision>]) -> RoutingMetadata {
     // The classifier trace is [classify, route]; the routed decision is last.
     let decision = trace.last();
     let classifier = decision.and_then(|d| d.as_any().downcast_ref::<ClassifierDecision>());
     RoutingMetadata {
-        selected_model: decision.map(|d| d.model_decision().to_string()),
+        selected_model: decision.map(|d| d.selected_model().to_string()),
         selected_tier: classifier.and_then(|c| c.tier.map(|t| t.as_str().to_string())),
         confidence: classifier.and_then(|c| c.score),
         router_version: Some("libsy-classifier".to_string()),
@@ -207,7 +203,7 @@ fn routing_metadata(trace: &[Arc<dyn DecisionTrace>]) -> RoutingMetadata {
     }
 }
 
-fn build_orchestrator() -> Result<MultiLlmOrchestrator> {
+fn build_orchestrator() -> Result<Arc<dyn Algorithm>> {
     let base_url =
         std::env::var("LIBSY_PROXY_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
@@ -223,11 +219,10 @@ fn build_orchestrator() -> Result<MultiLlmOrchestrator> {
     let backend = Arc::new(OpenAiPassthroughBackend::new(endpoint)?);
     let client = Arc::new(SwitchyardBackendClient { backend }) as Arc<dyn LlmClient>;
 
-    // One target per model id; all backed by the same upstream client. Here the
-    // routing name and provider model id coincide, so `model` mirrors `name`.
+    // One target per model id; all backed by the same upstream client. The
+    // provider model id is the semantic target name in this demo.
     let target = |name: &str| LlmTarget {
-        name: name.to_string(),
-        model: name.to_string(),
+        semantic_name: name.to_string(),
         llm_client: Some(client.clone()),
     };
     let targets = LlmTargetSet::new(vec![
@@ -236,14 +231,13 @@ fn build_orchestrator() -> Result<MultiLlmOrchestrator> {
         target(WEAK_MODEL),
     ]);
 
-    let algo = Arc::new(LlmClassifierOrchAlgo::new(
+    Ok(Arc::new(LlmClassifierOrchAlgo::new(
         CLASSIFIER_MODEL,
         STRONG_MODEL,
         WEAK_MODEL,
         CLASSIFIER_THRESHOLD,
         targets,
-    ));
-    Ok(MultiLlmOrchestrator::new(algo))
+    )))
 }
 
 #[tokio::main]
@@ -258,10 +252,16 @@ async fn main() -> Result<()> {
     )])?;
     let state = ServerState::new(registry);
 
-    let addr: SocketAddr = std::env::var("LIBSY_PROXY_ADDR")
+    let requested_addr: SocketAddr = std::env::var("LIBSY_PROXY_ADDR")
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
         .parse()
         .map_err(|e: std::net::AddrParseError| SwitchyardError::InvalidConfig(e.to_string()))?;
+    let listener = TcpListener::bind(requested_addr)
+        .await
+        .map_err(|e| SwitchyardError::Other(e.to_string()))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| SwitchyardError::Other(e.to_string()))?;
 
     println!("libsy-proxy listening on http://{addr}");
     println!("  routing (libsy classifier): classifier={CLASSIFIER_MODEL}");
@@ -271,5 +271,7 @@ async fn main() -> Result<()> {
         "  send model \"{PROFILE_MODEL_ID}\" to /v1/chat/completions, /v1/messages, or /v1/responses"
     );
 
-    serve_addr(addr, state).await
+    axum::serve(listener, build_switchyard_router(state))
+        .await
+        .map_err(|e| SwitchyardError::Other(e.to_string()))
 }

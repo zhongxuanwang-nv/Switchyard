@@ -712,6 +712,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "switchyard-translation",
  "tokio",
  "tokio-stream",
 ]
@@ -721,6 +722,7 @@ name = "libsy-proxy"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "libsy",
  "serde_json",
  "switchyard-components",
