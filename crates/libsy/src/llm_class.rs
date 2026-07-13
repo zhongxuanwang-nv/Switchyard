@@ -175,10 +175,6 @@ impl Algorithm for LlmClassifierOrchAlgo {
         // Stateless classification; agent-system signals are ignored.
         Ok(())
     }
-
-    fn get_target_set(self: Arc<Self>) -> LlmTargetSet {
-        self.target_set.clone()
-    }
 }
 
 #[cfg(test)]

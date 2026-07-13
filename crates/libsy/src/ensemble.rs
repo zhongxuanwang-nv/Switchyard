@@ -390,10 +390,6 @@ impl Algorithm for EnsembleOrchAlgo {
         // Success is measured by the judge, not agent-system signals.
         Ok(())
     }
-
-    fn get_target_set(self: Arc<Self>) -> LlmTargetSet {
-        self.target_set.clone()
-    }
 }
 
 #[cfg(test)]

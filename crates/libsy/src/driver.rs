@@ -1,21 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! # driver — promise-over-a-stream request pumps
+//! # driver — a type-erased promise-over-a-stream request pump
 //!
-//! Two layers live here: [`TypeErasedDriver`] is the generic primitive, and [`Driver`]
-//! is the libsy-typed pump built on it. [`Driver`] fixes the request/response types to
-//! libsy's ([`call_llm`](Driver::call_llm) / [`call_llm_target`](Driver::call_llm_target)
-//! offload a call and await a [`Response`](crate::Response), [`info`](Driver::info)
-//! publishes a [`Decision`](crate::Decision), [`finish`](Driver::finish) emits the
-//! terminal response) and maps the raw steps to libsy [`Step`](crate::Step)s
-//! ([`stream`](Driver::stream)). The rest of this doc describes the primitive.
+//! [`TypeErasedDriver`] is the generic offload primitive; the crate root builds the
+//! libsy-typed `Driver` on top of it. This module has no dependency on the rest of the
+//! crate — the coupling is one-directional (`lib.rs` → `driver.rs`).
 //!
-//! A [`TypeErasedDriver`] lets a *producer* (e.g. an [`Algorithm`](crate::Algorithm)) fulfill
+//! A [`TypeErasedDriver`] lets a *producer* (e.g. a routing algorithm) fulfill
 //! arbitrary requests by publishing promises onto a stream that a single *consumer*
-//! drains. It is the type-erased generalization of the offload mechanism in
-//! [`Algorithm::run_stream`](crate::Algorithm::run_stream): instead of one fixed
-//! request/response shape, a producer calls [`fulfill_request`](TypeErasedDriver::fulfill_request)
+//! drains. It is the type-erased generalization of the crate's `run_stream` offload:
+//! instead of one fixed request/response shape, a producer calls
+//! [`fulfill_request`](TypeErasedDriver::fulfill_request)
 //! with *any* `REQ` and awaits *any* `RES`.
 //!
 //! - [`fulfill_request`](TypeErasedDriver::fulfill_request) enqueues a [`DriverStep::Request`]
@@ -59,8 +55,6 @@ use std::{
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-
-use crate::{CallLlmRequest, Decision, LlmTarget, Request, Response, RoutedRequest, Step};
 
 type BoxErr = Box<dyn Error + Send + Sync>;
 type BoxAny = Box<dyn Any + Send>;
@@ -203,8 +197,8 @@ impl TypeErasedDriver {
     }
 
     /// Terminate the stream with an error item — the producer-side way to surface a
-    /// failure to the consumer (mirrors how [`Algorithm::run_stream`](crate::Algorithm::run_stream)
-    /// yields an `Err` step). Awaits channel capacity and errors only if the stream is
+    /// failure to the consumer (mirrors how the crate's `run_stream` yields an `Err`
+    /// step). Awaits channel capacity and errors only if the stream is
     /// already closed.
     pub async fn fail(&self, err: BoxErr) -> Result<(), BoxErr> {
         self.inner
@@ -233,93 +227,6 @@ impl TypeErasedDriver {
 }
 
 impl Default for TypeErasedDriver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The libsy-typed request pump: a [`TypeErasedDriver`] specialized to libsy's request
-/// vocabulary. [`call_llm`](Self::call_llm) / [`call_llm_target`](Self::call_llm_target)
-/// offload a call and await a [`Response`]; [`info`](Self::info) publishes a
-/// [`Decision`]; [`finish`](Self::finish) emits the terminal [`Response`]; and
-/// [`stream`](Self::stream) transforms the raw driver stream into a stream of
-/// [`Step`]s. The underlying step channel is bounded (capacity 1), so the consumer
-/// paces the algorithm one step at a time. Cloning shares the same channel (the
-/// producer side): [`run_stream`](crate::Algorithm::run_stream) takes the consumer
-/// stream, then hands a clone to the algorithm task to publish on.
-#[derive(Clone)]
-pub struct Driver {
-    driver: TypeErasedDriver,
-}
-
-impl Driver {
-    /// Build an empty driver with its step channel ready.
-    pub fn new() -> Self {
-        Self {
-            driver: TypeErasedDriver::new(),
-        }
-    }
-
-    /// Offload a model call: publish `routed` as a [`Step::CallLlm`] and await the
-    /// consumer's [`Response`]. Errors if the stream is closed or the call failed.
-    pub async fn call_llm(&self, routed: RoutedRequest) -> Result<Response, BoxErr> {
-        self.driver
-            .fulfill_request::<RoutedRequest, Response>(routed)
-            .await
-    }
-
-    /// Offload a call to `target`: pair `request` with `decision` and the target's
-    /// default client into a [`RoutedRequest`], then publish it (see
-    /// [`call_llm`](Self::call_llm)). The convenience most algorithms use;
-    /// `decision.selected_model()` names the model to hit, and `request`'s
-    /// `inbound_model_name` is left untouched.
-    pub async fn call_llm_target(
-        &self,
-        target: &LlmTarget,
-        request: Request,
-        decision: Arc<dyn Decision>,
-    ) -> Result<Response, BoxErr> {
-        self.call_llm(RoutedRequest {
-            request,
-            decision,
-            default_client: target.llm_client.clone(),
-        })
-        .await
-    }
-
-    /// Publish a routing [`Decision`] as a [`Step::Decision`] on the stream.
-    pub async fn info(&self, decision: Arc<dyn Decision>) -> Result<(), BoxErr> {
-        self.driver.info(decision).await
-    }
-
-    /// Emit the terminal step: [`Step::ReturnToAgent`] on `Ok`, or an `Err` stream
-    /// item on failure. Called once when the algorithm finishes.
-    pub async fn finish(&self, result: Result<Response, BoxErr>) -> Result<(), BoxErr> {
-        match result {
-            Ok(response) => self.driver.done(response).await,
-            Err(err) => self.driver.fail(err).await,
-        }
-    }
-
-    /// Transform the raw driver stream into a stream of [`Step`]s. Callable once (the
-    /// underlying receiver is taken once). A payload that does not match the expected
-    /// type for its step becomes an `Err` item.
-    pub fn stream(&self) -> impl Stream<Item = Result<Step, BoxErr>> {
-        self.driver.stream().map(|item| match item? {
-            DriverStep::Request(req) => Ok(Step::CallLlm(CallLlmRequest::new(req))),
-            DriverStep::Info(payload) => payload
-                .downcast::<Arc<dyn Decision>>()
-                .map(|decision| Step::Decision(*decision))
-                .map_err(|_| "driver: info payload was not a Decision".into()),
-            DriverStep::Done(payload) => payload
-                .downcast::<Response>()
-                .map(|response| Step::ReturnToAgent(*response))
-                .map_err(|_| "driver: done payload was not a Response".into()),
-        })
-    }
-}
-
-impl Default for Driver {
     fn default() -> Self {
         Self::new()
     }
