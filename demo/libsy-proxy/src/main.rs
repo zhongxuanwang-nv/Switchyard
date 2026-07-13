@@ -31,9 +31,9 @@ use serde_json::{json, Value};
 
 use libsy::llm_class::{ClassifierDecision, LlmClassifierOrchAlgo};
 use libsy::{
-    request_text, response_text, text_request, text_response, Algorithm, Context, Decision,
-    LlmClient, LlmTarget, LlmTargetSet, Request as LibsyRequest, Response as LibsyResponse,
-    RoutedRequest,
+    Algorithm, Context, Decision, LlmClient, LlmContentBlock, LlmMessage, LlmRequest, LlmResponse,
+    LlmResponseOutput, LlmRole, LlmTarget, LlmTargetSet, Request as LibsyRequest,
+    Response as LibsyResponse, RoutedRequest,
 };
 
 use switchyard_components::OpenAiPassthroughBackend;
@@ -70,7 +70,29 @@ impl LlmClient for SwitchyardBackendClient {
         routed: RoutedRequest,
     ) -> std::result::Result<LibsyResponse, Box<dyn std::error::Error + Send + Sync>> {
         let model = routed.decision.selected_model().to_string();
-        let prompt = request_text(&routed.request.llm_request);
+        let prompt = routed
+            .request
+            .llm_request
+            .instructions
+            .iter()
+            .flat_map(|instruction| instruction.content.iter())
+            .chain(
+                routed
+                    .request
+                    .llm_request
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.content.iter()),
+            )
+            .filter_map(|block| match block {
+                LlmContentBlock::Text { text }
+                | LlmContentBlock::Refusal { text }
+                | LlmContentBlock::Reasoning { text, .. } => Some(text.as_str()),
+                LlmContentBlock::Unknown { raw, .. } => raw.as_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         // Build a single-shot OpenAI chat request for the chosen model.
         let body = json!({
             "model": model,
@@ -89,7 +111,14 @@ impl LlmClient for SwitchyardBackendClient {
         let raw = response.body().cloned().unwrap_or(Value::Null);
         let completion = completion_text(&raw).unwrap_or_default();
         Ok(LibsyResponse {
-            llm_response: text_response(completion),
+            llm_response: LlmResponse {
+                outputs: vec![LlmResponseOutput {
+                    role: LlmRole::Assistant,
+                    content: vec![LlmContentBlock::Text { text: completion }],
+                    stop_reason: None,
+                }],
+                ..LlmResponse::default()
+            },
             metadata: None,
         })
     }
@@ -110,7 +139,11 @@ impl Profile for LibsyClassifierProfile {
             .ok_or_else(|| SwitchyardError::InvalidRequest("no user prompt in request".into()))?;
 
         let orch_request = LibsyRequest {
-            llm_request: text_request(PROFILE_MODEL_ID, prompt),
+            llm_request: LlmRequest {
+                model: Some(PROFILE_MODEL_ID.to_string()),
+                messages: vec![LlmMessage::text(LlmRole::User, prompt)],
+                ..LlmRequest::default()
+            },
             raw_request: Some(input.request.body().clone()),
             metadata: None,
         };
@@ -127,11 +160,25 @@ impl Profile for LibsyClassifierProfile {
 
         // Return an OpenAI chat-completion body; switchyard reconciles it against
         // the caller's inbound format.
+        let content = response
+            .llm_response
+            .outputs
+            .iter()
+            .flat_map(|output| output.content.iter())
+            .filter_map(|block| match block {
+                LlmContentBlock::Text { text }
+                | LlmContentBlock::Refusal { text }
+                | LlmContentBlock::Reasoning { text, .. } => Some(text.as_str()),
+                LlmContentBlock::Unknown { raw, .. } => raw.as_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let body = json!({
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
-                "message": { "role": "assistant", "content": response_text(&response.llm_response) },
+                "message": { "role": "assistant", "content": content },
                 "finish_reason": "stop",
             }],
         });
