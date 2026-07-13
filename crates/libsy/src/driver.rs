@@ -6,7 +6,7 @@
 //! A [`Driver`] lets a *producer* (e.g. an [`Algorithm`](crate::Algorithm)) fulfill
 //! arbitrary requests by publishing promises onto a stream that a single *consumer*
 //! drains. It is the type-erased generalization of the offload mechanism in
-//! [`Switchyard::run`](crate::Switchyard::run): instead of one fixed
+//! [`Algorithm::stream_steps`](crate::Algorithm::stream_steps): instead of one fixed
 //! request/response shape, a producer calls [`fulfill_request`](Driver::fulfill_request)
 //! with *any* `REQ` and awaits *any* `RES`.
 //!
@@ -193,7 +193,7 @@ impl Driver {
     }
 
     /// Terminate the stream with an error item — the producer-side way to surface a
-    /// failure to the consumer (mirrors how [`Switchyard::run`](crate::Switchyard::run)
+    /// failure to the consumer (mirrors how [`Algorithm::stream_steps`](crate::Algorithm::stream_steps)
     /// yields an `Err` step). Awaits channel capacity and errors only if the stream is
     /// already closed.
     pub async fn fail(&self, err: BoxErr) -> Result<(), BoxErr> {

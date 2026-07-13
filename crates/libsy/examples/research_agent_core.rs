@@ -3,7 +3,7 @@
 
 //! Research agent driving the raw `run` stream with **client-less** targets.
 //!
-//! With no client, every `target.call` is offloaded as a promise the orchestrator
+//! With no client, every `driver.call_target` is offloaded as a promise the orchestrator
 //! surfaces as a `CallLlm` step. The agent makes the "real" model call itself and
 //! fulfills the promise — this is the offload/streaming path ("ask, don't call").
 //! The classifier's two steps show up as two `model call:` lines. Run with:
@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use libsy::llm_class::LlmClassifierOrchAlgo;
 use libsy::{
-    Decision, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request, Response, Step, Switchyard,
+    Algorithm, Context, Decision, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request,
+    Response, Step,
 };
 use tokio_stream::StreamExt;
 
@@ -51,7 +52,7 @@ fn targets() -> LlmTargetSet {
 }
 
 struct ResearchAgent {
-    orchestrator: Switchyard,
+    algo: Arc<dyn Algorithm>,
 }
 
 impl ResearchAgent {
@@ -71,20 +72,18 @@ impl ResearchAgent {
                 raw_request: None,
                 metadata: None,
             };
-            let stream = self.orchestrator.run(request);
+            let stream = self.algo.clone().stream_steps(Context::default(), request);
             tokio::pin!(stream);
             while let Some(update) = stream.next().await {
                 match update? {
-                    Step::CallLlm(promises) => {
-                        for promise in promises {
-                            // Perform the model call the algorithm asked for, then fulfill.
-                            let response =
-                                call_model(promise.get_decision().selected_model()).await;
-                            promise.respond(Ok(response)).await?;
-                        }
+                    Step::CallLlm(call) => {
+                        // Perform the model call the algorithm asked for, then fulfill.
+                        let response = call_model(call.get_decision()?.selected_model()).await;
+                        call.respond(Ok(response))?;
                     }
-                    Step::ReturnToAgent(trace, response) => {
-                        print_trace(&trace);
+                    // Decisions stream in as the algorithm makes them.
+                    Step::Decision(decision) => print_decision(decision.as_ref()),
+                    Step::ReturnToAgent(response) => {
                         notes.push(response.llm_response.completion);
                     }
                 }
@@ -94,29 +93,26 @@ impl ResearchAgent {
     }
 }
 
-/// Print each decision the algorithm recorded — uniform access via the trait.
-fn print_trace(trace: &[Arc<dyn Decision>]) {
-    for decision in trace {
-        println!(
-            "    decision: {} ({})",
-            decision.selected_model(),
-            decision.reasoning().unwrap_or_default()
-        );
-    }
+/// Print one decision the algorithm recorded — uniform access via the trait.
+fn print_decision(decision: &dyn Decision) {
+    println!(
+        "    decision: {} ({})",
+        decision.selected_model(),
+        decision.reasoning().unwrap_or_default()
+    );
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let algo = Arc::new(LlmClassifierOrchAlgo::new(
+    let algo: Arc<dyn Algorithm> = Arc::new(LlmClassifierOrchAlgo::new(
         CLASSIFIER,
         STRONG,
         WEAK,
         0.5,
         targets(),
     ));
-    let orchestrator = Switchyard::new(algo);
 
-    let mut agent = ResearchAgent { orchestrator };
+    let mut agent = ResearchAgent { algo };
     println!("{}", agent.run("what is switchyard?").await?);
     Ok(())
 }

@@ -5,7 +5,7 @@
 //!
 //! Selects one target from the set uniformly at random and calls it. This is the
 //! simplest possible routing algorithm and the reference for the single-call
-//! shape: one `target.call` inside `process_request`. (Weighted selection could
+//! shape: one `driver.call_target` inside `process_request_task`. (Weighted selection could
 //! be layered on later; the set defines the candidates.)
 
 use std::error::Error;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rand::seq::SliceRandom;
 
-use crate::{Algorithm, Context, Decision, LlmTargetSet, Request, Response, Signals};
+use crate::{Algorithm, Context, Decision, LlmTargetSet, Request, Response, Signals, SyDriver};
 
 /// Decision produced by [`RandomOrchAlgo`]: which target was chosen and why.
 pub struct RandomDecision {
@@ -43,8 +43,9 @@ pub struct RandomOrchAlgo {
 
 impl RandomOrchAlgo {
     /// Create a router over `target_set`. Wrap it in an
-    /// [`Arc`](std::sync::Arc) and hand it to
-    /// [`Switchyard::new`](crate::Switchyard::new) to run it.
+    /// [`Arc`](std::sync::Arc) and drive it with
+    /// [`process_request`](crate::Algorithm::process_request) or
+    /// [`stream_steps`](crate::Algorithm::stream_steps).
     pub fn new(target_set: LlmTargetSet) -> Self {
         Self { target_set }
     }
@@ -52,11 +53,12 @@ impl RandomOrchAlgo {
 
 #[async_trait]
 impl Algorithm for RandomOrchAlgo {
-    async fn process_request(
-        &self,
-        ctx: &Context,
+    async fn process_request_task(
+        self: Arc<Self>,
+        _ctx: Context,
+        driver: SyDriver,
         request: Request,
-    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
+    ) -> Result<Response, Box<dyn Error + Send + Sync>> {
         // Select a target uniformly at random. Scope the RNG so the non-Send
         // `ThreadRng` is dropped before the await below, keeping the returned
         // future `Send` (required by the `Algorithm` bound).
@@ -77,8 +79,9 @@ impl Algorithm for RandomOrchAlgo {
             selected_model: selected,
         });
 
-        let response = target.call(ctx, request, decision.clone()).await?;
-        Ok((vec![decision], response))
+        // Publish the decision to the stream, then offload the call.
+        driver.info(decision.clone()).await?;
+        driver.call_target(&target, request, decision).await
     }
 
     async fn process_signals(&self, _signals: Signals) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -128,9 +131,9 @@ mod tests {
         }
     }
 
-    // Client-less-free tests: a channel-less context, since no call offloads.
-    fn ctx() -> Context {
-        Context::default()
+    /// Build a random-routing algorithm over `names`; every target echoes its name.
+    fn orch(names: &[&str]) -> Arc<dyn Algorithm> {
+        Arc::new(algo(names))
     }
 
     fn algo(names: &[&str]) -> RandomOrchAlgo {
@@ -147,8 +150,11 @@ mod tests {
     #[tokio::test]
     async fn single_target_is_always_selected_and_called(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let algo = algo(&["only/model"]);
-        let (trace, response) = algo.process_request(&ctx(), request()).await?;
+        let orch = orch(&["only/model"]);
+        let (trace, response) = orch
+            .clone()
+            .process_request(Context::default(), request())
+            .await?;
         assert_eq!(response.llm_response.completion, "only/model");
         assert_eq!(trace.len(), 1);
         assert_eq!(trace[0].selected_model(), "only/model");
@@ -159,9 +165,12 @@ mod tests {
     async fn selected_target_is_in_the_set_and_matches_the_trace(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let names = ["a/model", "b/model", "c/model"];
-        let algo = algo(&names);
+        let orch = orch(&names);
         for _ in 0..50 {
-            let (trace, response) = algo.process_request(&ctx(), request()).await?;
+            let (trace, response) = orch
+                .clone()
+                .process_request(Context::default(), request())
+                .await?;
             let selected = response.llm_response.completion.clone();
             assert!(
                 names.contains(&selected.as_str()),
@@ -176,10 +185,13 @@ mod tests {
     #[tokio::test]
     async fn selection_covers_all_targets_over_many_runs(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let algo = algo(&["a/model", "b/model"]);
+        let orch = orch(&["a/model", "b/model"]);
         let mut seen = HashSet::new();
         for _ in 0..100 {
-            let (_, response) = algo.process_request(&ctx(), request()).await?;
+            let (_, response) = orch
+                .clone()
+                .process_request(Context::default(), request())
+                .await?;
             seen.insert(response.llm_response.completion);
         }
         // 100 uniform draws over two targets: both should appear (miss ~ 2^-99).
@@ -193,8 +205,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_target_set_errors() {
-        let algo = algo(&[]);
-        assert!(algo.process_request(&ctx(), request()).await.is_err());
+        let orch = orch(&[]);
+        assert!(orch
+            .clone()
+            .process_request(Context::default(), request())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -206,8 +222,11 @@ mod tests {
 
     #[tokio::test]
     async fn decision_is_inspectable_and_downcasts() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let algo = algo(&["only/model"]);
-        let (trace, _) = algo.process_request(&ctx(), request()).await?;
+        let orch = orch(&["only/model"]);
+        let (trace, _) = orch
+            .clone()
+            .process_request(Context::default(), request())
+            .await?;
         let decision = &trace[0];
         // Uniform, algo-agnostic access via the trait — no concrete type needed.
         assert_eq!(decision.selected_model(), "only/model");

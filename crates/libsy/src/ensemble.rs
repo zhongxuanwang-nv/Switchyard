@@ -13,10 +13,8 @@
 //! Unlike the reference routers, this algorithm is **stateful**: the win tally,
 //! turn counter, and committed choice live behind a [`std::sync::Mutex`] so one
 //! shared `&self` can serve a session's requests concurrently (see the
-//! `Algorithm` docs). In a proxy setup one [`Switchyard`] — and thus one
-//! `EnsembleOrchAlgo` — is created per session, so this state is per-session.
-//!
-//! [`Switchyard`]: crate::Switchyard
+//! `Algorithm` docs). In a proxy setup one `EnsembleOrchAlgo` is created per session,
+//! so this state is per-session.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -24,7 +22,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Algorithm, Context, Decision, LlmRequest, LlmTargetSet, Request, Response, Signals};
+use crate::{
+    Algorithm, Context, Decision, LlmRequest, LlmTargetSet, Request, Response, Signals, SyDriver,
+};
 
 /// Which step of the ensemble flow produced a decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,8 +100,9 @@ impl EnsembleOrchAlgo {
     /// Create an ensemble over `candidate_models`, judged by `judge_model`,
     /// exploring for `exploration_turns` before committing to the winningest
     /// candidate (`0` = never commit, ensemble every request), routing among
-    /// `target_set`. Wrap it in an [`Arc`](std::sync::Arc) for
-    /// [`Switchyard::new`](crate::Switchyard::new).
+    /// `target_set`. Wrap it in an [`Arc`](std::sync::Arc) and drive it with
+    /// [`process_request`](crate::Algorithm::process_request) or
+    /// [`stream_steps`](crate::Algorithm::stream_steps).
     pub fn new(
         candidate_models: Vec<String>,
         judge_model: impl Into<String>,
@@ -169,7 +170,7 @@ impl EnsembleOrchAlgo {
     /// Route a request to a single already-chosen model — the committed fast path.
     async fn route_committed(
         &self,
-        ctx: &Context,
+        driver: &SyDriver,
         request: Request,
         model: String,
     ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
@@ -192,7 +193,9 @@ impl EnsembleOrchAlgo {
             raw_request: request.raw_request,
             metadata: request.metadata,
         };
-        let response = target.call(ctx, routed, decision.clone()).await?;
+        let response = driver
+            .call_target(&target, routed, decision.clone())
+            .await?;
         Ok((vec![decision], response))
     }
 
@@ -200,7 +203,7 @@ impl EnsembleOrchAlgo {
     /// tally the winner, and return its response.
     async fn ensemble_turn(
         &self,
-        ctx: &Context,
+        driver: &SyDriver,
         request: Request,
     ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
         let user_prompt = request.llm_request.prompt.clone();
@@ -230,7 +233,12 @@ impl EnsembleOrchAlgo {
                 metadata: request.metadata.clone(),
             };
             let model = model.clone();
-            calls.push(async move { (model, target.call(ctx, call_request, decision).await) });
+            calls.push(async move {
+                (
+                    model,
+                    driver.call_target(&target, call_request, decision).await,
+                )
+            });
         }
         let results = futures::future::join_all(calls).await;
 
@@ -269,8 +277,8 @@ impl EnsembleOrchAlgo {
                 raw_request: request.raw_request.clone(),
                 metadata: request.metadata.clone(),
             };
-            let judge_response = judge_target
-                .call(ctx, judge_request, judge_decision.clone())
+            let judge_response = driver
+                .call_target(&judge_target, judge_request, judge_decision.clone())
                 .await?;
             // Fail open: an unparseable pick falls back to the first response.
             let choice = parse_choice(&judge_response.llm_response.completion, survivors.len());
@@ -351,17 +359,26 @@ fn parse_choice(completion: &str, count: usize) -> usize {
 
 #[async_trait]
 impl Algorithm for EnsembleOrchAlgo {
-    async fn process_request(
-        &self,
-        ctx: &Context,
+    async fn process_request_task(
+        self: Arc<Self>,
+        _ctx: Context,
+        driver: SyDriver,
         request: Request,
-    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
-        // Fast path: exploration is over — route straight to the committed model.
-        if let Some(model) = self.resolve_committed()? {
-            return self.route_committed(ctx, request, model).await;
+    ) -> Result<Response, Box<dyn Error + Send + Sync>> {
+        // Fast path: exploration is over — route straight to the committed model;
+        // otherwise run a full ensemble turn. Both return a decision trace plus the
+        // final response.
+        let (trace, response) = if let Some(model) = self.resolve_committed()? {
+            self.route_committed(&driver, request, model).await?
+        } else {
+            self.ensemble_turn(&driver, request).await?
+        };
+        // Publish the trace to the stream (candidate..., judge?, winner). The
+        // candidate decisions also rode along on their offloaded `CallLlm` steps.
+        for decision in trace {
+            driver.info(decision).await?;
         }
-        // Otherwise run a full ensemble turn.
-        self.ensemble_turn(ctx, request).await
+        Ok(response)
     }
 
     async fn process_signals(&self, _signals: Signals) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -496,9 +513,10 @@ mod tests {
         }
     }
 
-    // All test targets carry clients, so a channel-less context suffices.
-    fn ctx() -> Context {
-        Context::default()
+    /// Wrap an ensemble algo as `Arc<dyn Algorithm>` we can drive to completion.
+    /// Reuse one handle across requests to exercise the algo's per-session state.
+    fn orch(algo: EnsembleOrchAlgo) -> Arc<dyn Algorithm> {
+        Arc::new(algo)
     }
 
     fn as_ensemble(
@@ -514,7 +532,9 @@ mod tests {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Judge prefers b/model; it should win and be returned.
         let (algo, calls) = algo(&["a/model", "b/model"], "judge/haiku", "b/model", 100);
-        let (trace, response) = algo.process_request(&ctx(), request("solve it")).await?;
+        let (trace, response) = orch(algo)
+            .process_request(Context::default(), request("solve it"))
+            .await?;
         assert_eq!(response.llm_response.completion, "answer from b/model");
 
         // Both candidates and the judge were called.
@@ -539,10 +559,15 @@ mod tests {
         // Judge always prefers b/model over 2 exploration turns, so the algo
         // commits to b/model even though a/model is listed first.
         let (algo, calls) = algo(&["a/model", "b/model"], "judge/haiku", "b/model", 2);
+        let orch = orch(algo);
 
         // Two exploration turns.
-        algo.process_request(&ctx(), request("t1")).await?;
-        algo.process_request(&ctx(), request("t2")).await?;
+        orch.clone()
+            .process_request(Context::default(), request("t1"))
+            .await?;
+        orch.clone()
+            .process_request(Context::default(), request("t2"))
+            .await?;
         let judge_calls_after_exploration = calls
             .lock()
             .map_err(|_| "lock poisoned")?
@@ -553,7 +578,10 @@ mod tests {
 
         // Third request: committed fast path — routes straight to b/model with no
         // fan-out to a/model and no judge call.
-        let (trace, response) = algo.process_request(&ctx(), request("t3")).await?;
+        let (trace, response) = orch
+            .clone()
+            .process_request(Context::default(), request("t3"))
+            .await?;
         assert_eq!(response.llm_response.completion, "answer from b/model");
         assert_eq!(trace.len(), 1);
         let decision = as_ensemble(&trace[0])?;
@@ -571,7 +599,9 @@ mod tests {
     #[tokio::test]
     async fn single_candidate_skips_the_judge() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (algo, calls) = algo(&["only/model"], "judge/haiku", "only/model", 100);
-        let (trace, response) = algo.process_request(&ctx(), request("hi")).await?;
+        let (trace, response) = orch(algo)
+            .process_request(Context::default(), request("hi"))
+            .await?;
         assert_eq!(response.llm_response.completion, "answer from only/model");
         // No judge call for a lone candidate.
         assert!(!calls
@@ -588,8 +618,12 @@ mod tests {
     async fn zero_exploration_turns_never_commits() -> Result<(), Box<dyn Error + Send + Sync>> {
         // exploration_turns == 0 keeps ensembling forever.
         let (algo, calls) = algo(&["a/model", "b/model"], "judge/haiku", "b/model", 0);
+        let orch = orch(algo);
         for _ in 0..3 {
-            let (trace, _) = algo.process_request(&ctx(), request("x")).await?;
+            let (trace, _) = orch
+                .clone()
+                .process_request(Context::default(), request("x"))
+                .await?;
             // Always a full ensemble turn (never a lone Committed decision).
             assert_eq!(
                 as_ensemble(&trace[trace.len() - 1])?.phase,
@@ -637,7 +671,10 @@ mod tests {
                 target("judge/haiku"),
             ]),
         );
-        assert!(algo.process_request(&ctx(), request("x")).await.is_err());
+        assert!(orch(algo)
+            .process_request(Context::default(), request("x"))
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -663,12 +700,13 @@ mod tests {
         use std::time::Duration;
         use tokio::sync::Barrier;
 
-        // Candidate calls block on a shared barrier; judge calls (which run only
-        // after a session's candidates return) do not. Two sessions, each fanning
-        // out to two candidates, put 4 candidate calls in flight — only when all
-        // four have arrived does the barrier release. If the sessions were
-        // serialized, at most one session's 2 calls could be pending, the barrier
-        // would never reach 4, and the test would time out instead of passing.
+        // Candidate calls block on a shared barrier; judge calls do not. Each session
+        // serves its offloaded candidate calls one at a time (the step stream is
+        // bounded), so a session has exactly one candidate call in flight at once. The
+        // two sessions run concurrently, so the barrier releases only when both have a
+        // candidate call pending. If the sessions were serialized, at most one call
+        // could be pending, the barrier would never reach 2, and the test would time
+        // out instead of passing.
         struct BarrierClient {
             barrier: Arc<Barrier>,
             judge_model: String,
@@ -700,9 +738,8 @@ mod tests {
             }
         }
 
-        const CANDIDATES_PER_SESSION: usize = 2;
         const SESSIONS: usize = 2;
-        let barrier = Arc::new(Barrier::new(CANDIDATES_PER_SESSION * SESSIONS));
+        let barrier = Arc::new(Barrier::new(SESSIONS));
         let client = Arc::new(BarrierClient {
             barrier: barrier.clone(),
             judge_model: "judge/haiku".to_string(),
@@ -711,23 +748,23 @@ mod tests {
 
         // Two independent sessions: separate algo instances, each with its own
         // per-session state, sharing only the backend client.
-        let session_a = Arc::new(algo_with_client(
+        let session_a: Arc<dyn Algorithm> = Arc::new(algo_with_client(
             &["a/model", "b/model"],
             "judge/haiku",
             100,
             client.clone(),
         ));
-        let session_b = Arc::new(algo_with_client(
+        let session_b: Arc<dyn Algorithm> = Arc::new(algo_with_client(
             &["a/model", "b/model"],
             "judge/haiku",
             100,
             client.clone(),
         ));
 
-        let run = |session: Arc<EnsembleOrchAlgo>, prompt: &'static str| {
+        let run = |session: Arc<dyn Algorithm>, prompt: &'static str| {
             tokio::spawn(async move {
                 session
-                    .process_request(&ctx(), request(prompt))
+                    .process_request(Context::default(), request(prompt))
                     .await
                     .map(|(_, response)| response.llm_response.completion)
             })
@@ -756,11 +793,20 @@ mod tests {
         // Drive one session's three requests sequentially (so its two exploration
         // turns complete before the committing third), returning that third
         // request's winning model and decision phase.
-        let drive = |session: Arc<EnsembleOrchAlgo>| {
+        let drive = |session: Arc<dyn Algorithm>| {
             tokio::spawn(async move {
-                session.process_request(&ctx(), request("t1")).await?;
-                session.process_request(&ctx(), request("t2")).await?;
-                let (trace, response) = session.process_request(&ctx(), request("t3")).await?;
+                session
+                    .clone()
+                    .process_request(Context::default(), request("t1"))
+                    .await?;
+                session
+                    .clone()
+                    .process_request(Context::default(), request("t2"))
+                    .await?;
+                let (trace, response) = session
+                    .clone()
+                    .process_request(Context::default(), request("t3"))
+                    .await?;
                 let phase = trace
                     .last()
                     .and_then(|d| d.as_any().downcast_ref::<EnsembleDecision>())
@@ -773,8 +819,8 @@ mod tests {
             })
         };
         // The two sessions run in parallel; each committed independently.
-        let handle_a = drive(Arc::new(session_a));
-        let handle_b = drive(Arc::new(session_b));
+        let handle_a = drive(orch(session_a));
+        let handle_b = drive(orch(session_b));
         let (completion_a, phase_a) = handle_a.await??;
         let (completion_b, phase_b) = handle_b.await??;
 

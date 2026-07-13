@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Minimal research agent on `Switchyard` with **client-backed** targets.
+//! Minimal research agent using the [`Algorithm::process_request`] convenience.
 //!
-//! Every target owns an `LlmClient`, so no call is ever offloaded. That lets the
-//! agent use `run_direct` — one request in, the decision trace + final
-//! response out, no stream to drive. The multi-step routing (classify -> route) happens inside the
-//! classifier algorithm; the agent never sees it. Run with:
+//! Every target owns an `LlmClient`, so the agent runs each request to completion with
+//! [`Algorithm::process_request`]: it serves each offloaded call with the routed
+//! target's `default_client` and returns the final response — no stream to drive. The
+//! multi-step routing (classify -> route) happens inside the classifier algorithm; the
+//! agent never sees it. To drive the step stream yourself instead, use
+//! `Algorithm::stream_steps`. Run with:
 //!   cargo run -p libsy --example research_agent
 
 use std::error::Error;
@@ -15,8 +17,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use libsy::llm_class::LlmClassifierOrchAlgo;
 use libsy::{
-    Decision, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request, Response,
-    RoutedRequest, Switchyard,
+    Algorithm, Context, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request,
+    Response, RoutedRequest,
 };
 
 const CLASSIFIER: &str = "classifier/model";
@@ -58,7 +60,7 @@ fn targets() -> LlmTargetSet {
 }
 
 struct ResearchAgent {
-    orchestrator: Switchyard,
+    algo: Arc<dyn Algorithm>,
 }
 
 impl ResearchAgent {
@@ -78,24 +80,15 @@ impl ResearchAgent {
                 raw_request: None,
                 metadata: None,
             };
-            // Every target has a client, so nothing is offloaded: run the request
-            // and get the decision trace + final response directly, no stream.
-            let (trace, response) = self.orchestrator.run_direct(request).await?;
-            print_trace(&trace);
+
+            let (_trace, response) = self
+                .algo
+                .clone()
+                .process_request(Context::default(), request)
+                .await?;
             notes.push(response.llm_response.completion);
         }
         Ok(notes.join("\n"))
-    }
-}
-
-/// Print each decision the algorithm recorded — uniform access via the trait.
-fn print_trace(trace: &[Arc<dyn Decision>]) {
-    for decision in trace {
-        println!(
-            "    decision: {} ({})",
-            decision.selected_model(),
-            decision.reasoning().unwrap_or_default()
-        );
     }
 }
 
@@ -103,16 +96,15 @@ fn print_trace(trace: &[Arc<dyn Decision>]) {
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Configure routing once: an LLM classifier over three named targets. Swapping
     // in `RandomOrchAlgo` needs no change to the agent.
-    let algo = Arc::new(LlmClassifierOrchAlgo::new(
+    let algo: Arc<dyn Algorithm> = Arc::new(LlmClassifierOrchAlgo::new(
         CLASSIFIER,
         STRONG,
         WEAK,
         0.5,
         targets(),
     ));
-    let orchestrator = Switchyard::new(algo);
 
-    let agent = ResearchAgent { orchestrator };
+    let agent = ResearchAgent { algo };
     println!("{}", agent.run("what is switchyard?").await?);
     Ok(())
 }

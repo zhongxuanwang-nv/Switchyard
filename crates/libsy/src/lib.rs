@@ -13,39 +13,44 @@
 //! ## The model
 //!
 //! - An [`Algorithm`] is the optimization *algorithm*. Its
-//!   [`process_request`](Algorithm::process_request) runs once per request and
-//!   makes as many model calls as it needs — via [`LlmTarget::call`], which look
-//!   like ordinary calls — then returns a *decision trace* (a list of
-//!   [`Decision`]) plus the final [`Response`].
+//!   [`process_request_task`](Algorithm::process_request_task) runs once per request
+//!   and makes as many model calls as it needs — via [`SyDriver::call_target`], which look
+//!   like ordinary calls — publishes its [`Decision`]s with [`SyDriver::info`], and
+//!   returns the final [`Response`]. The provided
+//!   [`stream_steps`](Algorithm::stream_steps) drives that on its own task and hands
+//!   back a stream of [`Step`]s; [`process_request`](Algorithm::process_request) runs
+//!   it to completion with the targets' default clients.
 //! - An [`LlmTarget`] names a routing target by its [`semantic_name`](LlmTarget::semantic_name).
-//!   If it carries an [`LlmClient`] it *serves* its own calls; if not, the call is
-//!   *offloaded* to the host (see below).
-//! - A [`Switchyard`] drives requests through one algorithm (which owns
-//!   its [`LlmTargetSet`]). Construct the algorithm, then wrap it with
-//!   [`Switchyard::new`].
+//!   Every call is *offloaded* to the request's stream as a [`Step::CallLlm`]; the
+//!   target's [`LlmClient`], if any, rides along as
+//!   [`RoutedRequest::default_client`] so the host can serve it by default or
+//!   override it (see below).
 //!
-//! ## Two ways to run a request
+//! ## Running a request
 //!
-//! - [`Switchyard::run_direct`] — when every target has a
-//!   client, libsy makes all the calls itself and returns `(trace, response)`.
-//!   The simplest integration; use it when libsy holds the model clients.
-//! - [`Switchyard::run`] — returns a stream of
-//!   [`Step`]s. When the algorithm calls a *client-less* target, the
-//!   call is offloaded: the stream yields [`Step::CallLlm`] carrying
-//!   promises; the host performs the real model call and fulfills each promise
-//!   with [`CallLlmRequest::respond`]. When the algorithm finishes the stream
-//!   yields [`Step::ReturnToAgent`] with the trace and final response.
-//!   This "ask, don't call" mode lets a host that already owns its transport keep
-//!   control of every network call.
+//! Hold the algorithm as `Arc<dyn Algorithm>` and call one of two provided methods:
+//!
+//! - [`process_request`](Algorithm::process_request) — run to completion, serving each
+//!   offloaded call via its [`RoutedRequest::default_client`], and return the decision
+//!   trace plus the final [`Response`]. The simplest integration; use it when the
+//!   algorithm holds the model clients (it errors if a routed target has no client).
+//! - [`stream_steps`](Algorithm::stream_steps) — return a stream of [`Step`]s. Each
+//!   model call is offloaded: the stream yields a [`Step::CallLlm`] carrying a promise;
+//!   the host performs the real model call (optionally via the promise's
+//!   `default_client`) and fulfills it with [`CallLlmRequest::respond`]. Decisions
+//!   arrive as [`Step::Decision`] as the algorithm makes them, and the run ends with a
+//!   [`Step::ReturnToAgent`] carrying the final response. The step stream is bounded,
+//!   so pulling it paces the algorithm one step at a time — an "ask, don't call" mode
+//!   that lets a host that owns its transport keep control of every call.
 //!
 //! ## Concurrency
 //!
-//! [`Algorithm::process_request`] takes `&self` and the orchestrator holds
-//! `Arc<dyn Algorithm>` with no lock, so a single orchestrator serves many requests
-//! in parallel. Each [`run`](Switchyard::run) call gets
-//! its own promise channel, so offloaded calls never cross between concurrent
-//! requests. An algorithm is responsible for its own thread-safety — stateless
-//! (like the reference routers) or interior mutability over just its own state.
+//! [`Algorithm::process_request_task`] takes `self: Arc<Self>`, so one shared
+//! `Arc<dyn Algorithm>` (no lock) serves many requests in parallel. Each
+//! [`stream_steps`](Algorithm::stream_steps) call builds its own [`SyDriver`], so
+//! offloaded calls never cross between concurrent requests. An algorithm is
+//! responsible for its own thread-safety — stateless (like the reference routers) or
+//! interior mutability over just its own state.
 //!
 //! ## Reference algorithms
 //!
@@ -62,11 +67,20 @@ pub mod ensemble;
 pub mod llm_class;
 pub mod rand;
 
-use std::{error::Error, sync::Arc};
-use tokio::sync::oneshot;
+use std::{error::Error, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
-use tokio_stream::wrappers::ReceiverStream;
+use futures::{Stream, StreamExt};
+
+use crate::driver::{Driver, DriverRequest, DriverStep};
+
+/// Shorthand for the crate's boxed, thread-safe error type.
+type BoxErr = Box<dyn Error + Send + Sync>;
+
+/// A boxed, `Send` stream of [`Step`]s — the output of
+/// [`Algorithm::stream_steps`]. Boxed so the trait method that produces it keeps
+/// `Arc<dyn Algorithm>` object-safe.
+pub type StepStream = Pin<Box<dyn Stream<Item = Result<Step, BoxErr>> + Send>>;
 
 /// Correlation and routing metadata attached to a request or response.
 ///
@@ -114,7 +128,7 @@ pub struct Request {
 }
 
 /// Agentic-stack events fed to an algorithm out of band via
-/// [`Switchyard::process_signals`] (e.g. tool results, budget updates).
+/// [`Algorithm::process_signals`] (e.g. tool results, budget updates).
 ///
 /// A placeholder today; a stateful algorithm can begin consuming signals as the
 /// enum grows without changing the orchestrator contract.
@@ -166,121 +180,184 @@ pub trait Decision: Send + Sync {
 /// `request.llm_request.inbound_model_name` is the *inbound* name the agent asked
 /// for (libsy never overwrites it). A client maps `selected_model()` to the
 /// provider model id it hits.
+#[derive(Clone)]
 pub struct RoutedRequest {
     /// The request to serve; its `inbound_model_name` is the agent's original name.
     pub request: Request,
     /// The routing decision behind this call; `selected_model()` is the model to hit.
     pub decision: Arc<dyn Decision>,
+    /// The client that serves this call by default, or `None` when the routed target
+    /// had no client. Rides along on the offloaded call so a host driving the stream
+    /// can serve it by default or override it with its own transport.
+    pub default_client: Option<Arc<dyn LlmClient>>,
 }
 
-/// The host-facing half of an offloaded model call.
+/// The host-facing half of an offloaded model call, surfaced inside [`Step::CallLlm`].
 ///
-/// Yielded to the host inside [`Step::CallLlm`]. The host reads the
-/// request it should perform ([`get_request`](Self::get_request)) and the
-/// decision behind it ([`get_decision`](Self::get_decision)), makes the real model
-/// call, and fulfills the promise with [`respond`](Self::respond). That
-/// unblocks the algorithm's [`LlmTarget::call`] on the other side.
+/// Wraps a [`DriverRequest`] whose payload is a [`RoutedRequest`]. The host reads the
+/// routed request ([`get_routed`](Self::get_routed)) and the decision behind it
+/// ([`get_decision`](Self::get_decision)), performs (or delegates) the model call, and
+/// fulfills it with [`respond`](Self::respond) — unblocking the algorithm's
+/// [`SyDriver::call_model`] on the other side.
 pub struct CallLlmRequest {
-    pub request: RoutedRequest,
-    // Fulfilled exactly once — `respond` consumes `self` to send, so no `Option`.
-    tx: oneshot::Sender<Result<Response, Box<dyn Error + Send + Sync>>>,
-}
-
-/// The algorithm-facing half of an offloaded model call.
-///
-/// Held inside a client-less [`LlmTarget::call`], which awaits
-/// [`get_response`](Self::get_response) until the host fulfills the paired
-/// [`CallLlmRequest`]. Host code normally does not touch this type directly.
-struct CallLlmRequestRx {
-    // Awaited exactly once — `get_response` consumes `self`, so no `Option` and no
-    // memoized response.
-    rx: oneshot::Receiver<Result<Response, Box<dyn Error + Send + Sync>>>,
+    inner: DriverRequest,
 }
 
 impl CallLlmRequest {
-    /// The model call the host should perform to fulfill this promise.
-    pub fn get_request(&self) -> &Request {
-        &self.request.request
+    /// Wrap a driver request whose payload is a [`RoutedRequest`].
+    fn new(inner: DriverRequest) -> Self {
+        Self { inner }
+    }
+
+    /// The routed request the host should serve. Its
+    /// [`default_client`](RoutedRequest::default_client) serves the call by default,
+    /// and its `decision.selected_model()` names the model to hit. Errors if the
+    /// promise payload was not a [`RoutedRequest`].
+    pub fn get_routed(&self) -> Result<&RoutedRequest, BoxErr> {
+        self.inner.request::<RoutedRequest>()
+    }
+
+    /// The model request to perform (the [`Request`] inside the routed request).
+    pub fn get_request(&self) -> Result<&Request, BoxErr> {
+        Ok(&self.get_routed()?.request)
     }
 
     /// The decision that led to this call — its `selected_model()` is the model to hit.
-    pub fn get_decision(&self) -> &dyn Decision {
-        self.request.decision.as_ref()
+    pub fn get_decision(&self) -> Result<&dyn Decision, BoxErr> {
+        Ok(self.get_routed()?.decision.as_ref())
     }
 
     /// Fulfill the promise with the caller's model-call result. Pass `Err(..)` to
-    /// propagate a failed model call back to the algorithm that made the call.
-    /// Consumes the promise: it can only be fulfilled once.
-    /// respond -> rename
-    pub async fn respond(
-        self,
-        result: Result<Response, Box<dyn Error + Send + Sync>>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.tx.send(result).map_err(|_| "Failed to send result")?;
-        Ok(())
+    /// propagate a failed model call back to the algorithm. Consumes the promise: it
+    /// can only be fulfilled once.
+    pub fn respond(self, result: Result<Response, BoxErr>) -> Result<(), BoxErr> {
+        self.inner.respond::<Response>(result)
     }
 }
 
-impl CallLlmRequestRx {
-    /// Await the response the host provides via [`CallLlmRequest::respond`].
-    ///
-    /// Returns the fulfilled response, propagates the host's `Err` if the model
-    /// call failed, or errors if the promise was dropped unfulfilled. Consumes
-    /// `self`: awaited exactly once.
-    async fn get_response(self) -> Result<Response, Box<dyn Error + Send + Sync>> {
-        // Outer error: the sender was dropped without fulfilling the promise.
-        // Inner error: the caller's model call failed — propagate it to the algo.
-        match self.rx.await {
-            Ok(result) => result,
-            Err(_) => Err("Failed to receive result".into()),
+/// A libsy-typed request pump built on the generic [`Driver`](crate::driver::Driver).
+///
+/// Specializes the type-erased [`Driver`] to libsy's request vocabulary:
+/// [`call_model`](Self::call_model) offloads a [`RoutedRequest`] and awaits a
+/// [`Response`]; [`info`](Self::info) publishes a [`Decision`];
+/// [`finish`](Self::finish) emits the terminal [`Response`]; and
+/// [`stream`](Self::stream) transforms the native driver stream into a stream of
+/// [`Step`]s. The underlying step channel is bounded (capacity 1), so the stream
+/// consumer paces the algorithm one step at a time. Cloning shares the same channel
+/// (the producer side): [`stream_steps`](Algorithm::stream_steps) takes the consumer
+/// stream, then hands a clone to the algorithm task to publish on.
+#[derive(Clone)]
+pub struct SyDriver {
+    driver: Driver,
+}
+
+impl SyDriver {
+    /// Build an empty driver with its step channel ready.
+    pub fn new() -> Self {
+        Self {
+            driver: Driver::new(),
         }
     }
+
+    /// Offload a model call: publish `routed` as a [`Step::CallLlm`] and await the
+    /// consumer's [`Response`]. Errors if the stream is closed or the call failed.
+    pub async fn call_model(&self, routed: RoutedRequest) -> Result<Response, BoxErr> {
+        self.driver
+            .fulfill_request::<RoutedRequest, Response>(routed)
+            .await
+    }
+
+    /// Offload a call to `target`: pair `request` with `decision` and the target's
+    /// default client into a [`RoutedRequest`], then publish it (see
+    /// [`call_model`](Self::call_model)). The convenience most algorithms use;
+    /// `decision.selected_model()` names the model to hit, and `request`'s
+    /// `inbound_model_name` is left untouched.
+    pub async fn call_target(
+        &self,
+        target: &LlmTarget,
+        request: Request,
+        decision: Arc<dyn Decision>,
+    ) -> Result<Response, BoxErr> {
+        self.call_model(RoutedRequest {
+            request,
+            decision,
+            default_client: target.llm_client.clone(),
+        })
+        .await
+    }
+
+    /// Publish a routing [`Decision`] as a [`Step::Decision`] on the stream.
+    pub async fn info(&self, decision: Arc<dyn Decision>) -> Result<(), BoxErr> {
+        self.driver.info(decision).await
+    }
+
+    /// Emit the terminal step: [`Step::ReturnToAgent`] on `Ok`, or an `Err` stream
+    /// item on failure. Called once when the algorithm finishes.
+    pub async fn finish(&self, result: Result<Response, BoxErr>) -> Result<(), BoxErr> {
+        match result {
+            Ok(response) => self.driver.done(response).await,
+            Err(err) => self.driver.fail(err).await,
+        }
+    }
+
+    /// Transform the native [`Driver`] stream into a stream of [`Step`]s. Callable
+    /// once (the underlying receiver is taken once). A payload that does not match the
+    /// expected type for its step becomes an `Err` item.
+    pub fn stream(&self) -> impl Stream<Item = Result<Step, BoxErr>> {
+        self.driver.stream().map(|item| match item? {
+            DriverStep::Request(req) => Ok(Step::CallLlm(CallLlmRequest::new(req))),
+            DriverStep::Info(payload) => payload
+                .downcast::<Arc<dyn Decision>>()
+                .map(|decision| Step::Decision(*decision))
+                .map_err(|_| "sydriver: info payload was not a Decision".into()),
+            DriverStep::Done(payload) => payload
+                .downcast::<Response>()
+                .map(|response| Step::ReturnToAgent(*response))
+                .map_err(|_| "sydriver: done payload was not a Response".into()),
+        })
+    }
 }
 
-/// Create a paired promise for one offloaded model call: the [`CallLlmRequest`] is
-/// handed to the host, the [`CallLlmRequestRx`] is awaited by the algorithm's target.
-/// Used internally by the offload path; exposed for algorithms/hosts that build
-/// their own offloading.
-fn llm_promise(request: RoutedRequest) -> (CallLlmRequest, CallLlmRequestRx) {
-    let (tx, rx) = oneshot::channel();
-    (CallLlmRequest { request, tx }, CallLlmRequestRx { rx })
+impl Default for SyDriver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// Per-request state the orchestrator threads to each [`LlmTarget::call`].
+/// Per-request state threaded to an algorithm alongside its [`SyDriver`].
 ///
-/// Its job is to carry the current request's offload channel, so a client-less
-/// target hands its promise to *this* request's channel and never to another's.
-/// Each [`run`](Switchyard::run) run builds its own
-/// context and passes it (by reference) down through the algorithm — which is what
-/// lets many requests run concurrently with no shared or global state. In
-/// [`run_direct`](Switchyard::run_direct) (or when an
-/// algorithm is called directly, e.g. in tests) the context carries no channel, so
-/// an unexpected offload errors instead of going nowhere.
+/// A placeholder for cross-cutting request state — correlation ids, budgets,
+/// deadlines, cancellation — that algorithms will read as the enum grows. It does
+/// *not* carry the offload driver: that is created per call by
+/// [`stream_steps`](Algorithm::stream_steps) and passed separately, so sharing a
+/// `Context` across concurrent requests is safe.
 #[derive(Clone, Default)]
-pub struct Context {
-    // The current request's promise sender, or `None` when offloading is
-    // unavailable (direct mode). Private: only the orchestrator populates it, and
-    // only `LlmTarget::call` reads it to offload. Unbounded so an algorithm can
-    // hand off a promise without awaiting channel capacity (it then awaits the
-    // response); the driver drains it promptly.
-    promise_tx: Option<tokio::sync::mpsc::UnboundedSender<CallLlmRequest>>,
+pub struct Context {}
+
+impl Context {
+    /// Build an empty context.
+    pub fn new() -> Self {
+        Self {}
+    }
 }
 
-/// One item in the stream returned by [`Switchyard::run`].
+/// One item in the stream returned by [`SyDriver::stream`] / [`Algorithm::stream_steps`].
 pub enum Step {
-    /// The algorithm needs these model calls performed. The host fulfills each
-    /// promise with [`CallLlmRequest::respond`]; only client-less targets
-    /// produce these steps.
-    CallLlm(Vec<CallLlmRequest>),
-    /// The algorithm finished: its decision trace and the final response. This is
-    /// the last step of a successful run.
-    ReturnToAgent(Vec<Arc<dyn Decision>>, Response),
+    /// The algorithm needs this model call performed. The host serves it (optionally
+    /// via [`RoutedRequest::default_client`]) and fulfills it with
+    /// [`CallLlmRequest::respond`].
+    CallLlm(CallLlmRequest),
+    /// A routing decision the algorithm made, published via [`SyDriver::info`] as it
+    /// happens (rather than collected into a trace returned at the end).
+    Decision(Arc<dyn Decision>),
+    /// The algorithm finished with its final response — the last step of a run.
+    ReturnToAgent(Response),
 }
 
 /// Performs the actual model call for a target. This is the one piece of I/O
 /// `libsy` does not own — a host implements it over its own transport (HTTP SDK,
-/// in-process model, mock). A target that carries an `LlmClient` *serves* its own
-/// calls; one without offloads them (see [`Switchyard::run`]).
+/// in-process model, mock). It serves a call the stream consumer chose not to
+/// override, reached as [`RoutedRequest::default_client`] (see [`Algorithm::stream_steps`]).
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// Serve `routed`, returning the model's response. Call the model named by
@@ -294,10 +371,9 @@ pub trait LlmClient: Send + Sync {
 /// A named routing target, optionally backed by an [`LlmClient`].
 ///
 /// An algorithm selects a target by its [`semantic_name`](Self::semantic_name) and
-/// calls it. With a client, [`call`](Self::call) invokes it directly. Without one,
-/// `call` offloads to the promise channel in the [`Context`] it is given — which
-/// exists only inside an [`run`](Switchyard::run) run; a client-less call made with
-/// a channel-less context (e.g. `run_direct`) errors.
+/// calls it. [`call`](Self::call) offloads every call to the request's stream via the
+/// [`Context`] it is given; the target's client, if any, rides along as
+/// [`RoutedRequest::default_client`] for the stream consumer to serve or override.
 #[derive(Clone)]
 pub struct LlmTarget {
     /// The routing name an algorithm selects this target by (a logical tier like
@@ -311,44 +387,10 @@ pub struct LlmTarget {
 
 impl LlmTarget {
     /// Whether this target can serve its own call (has a client). Used by
-    /// [`LlmTargetSet::all_have_clients`] to decide if `run_direct` is safe.
+    /// [`LlmTargetSet::all_have_clients`] to decide if every call has a default client
+    /// (so [`Algorithm::process_request`] can serve them all).
     pub fn has_client(&self) -> bool {
         self.llm_client.is_some()
-    }
-
-    /// Perform (or offload) the model call, tagging it with the algorithm's
-    /// `decision` so a host driving the stream can see *why* the call was made.
-    ///
-    /// A client-backed target serves the call directly; a client-less one offloads
-    /// via `ctx`'s promise channel. An algorithm gets `ctx` from its
-    /// `process_request` and passes it straight through.
-    pub async fn call(
-        &self,
-        ctx: &Context,
-        request: Request,
-        decision: Arc<dyn Decision>,
-    ) -> Result<Response, Box<dyn Error + Send + Sync>> {
-        // Pair the request with its decision; the selected model rides on
-        // `decision.selected_model()`, so the request's `inbound_model_name` is left
-        // untouched. The client (or offload host) reads the model off the decision.
-        let routed = RoutedRequest { request, decision };
-        match &self.llm_client {
-            Some(client) => client.call(routed).await,
-            None => {
-                // No client: offload via a promise on this request's channel. The
-                // decision rides along on the RoutedRequest so the orchestrator can
-                // surface it on its stream. The context has no channel outside a run().
-                let promise_tx = ctx.promise_tx.as_ref().ok_or_else(|| {
-                    format!(
-                        "target '{}' has no client and no offload channel",
-                        self.semantic_name
-                    )
-                })?;
-                let (tx, rx) = llm_promise(routed);
-                promise_tx.send(tx).map_err(|_| "Failed to send promise")?;
-                rx.get_response().await
-            }
-        }
     }
 }
 
@@ -380,36 +422,43 @@ impl LlmTargetSet {
             .ok_or(format!("Target {} not found", name).into())
     }
 
-    /// Whether every target can serve its own call — the precondition for
-    /// [`Switchyard::run_direct`].
+    /// Whether every target can serve its own call — i.e. every offloaded call has a
+    /// [`RoutedRequest::default_client`], so [`Algorithm::process_request`] can serve
+    /// them all without the host driving the stream.
     pub fn all_have_clients(&self) -> bool {
         self.targets.iter().all(|t| t.has_client())
     }
 }
 
-/// A stateful optimization algorithm. `process_request` is called once per
-/// request; inside it the algorithm makes as many `LlmTarget::call`s as it needs
-/// (each may be served directly or offloaded), and returns a decision trace plus
-/// the final response. `process_signals` feeds it agentic-stack events.
+/// A stateful optimization algorithm. `process_request_task` runs once per request;
+/// inside it the algorithm makes as many `SyDriver::call_target`s as it needs (all
+/// offloaded to the request's stream via [`SyDriver::call_model`]), publishes its
+/// decisions with [`SyDriver::info`], and returns the final response. The provided
+/// [`stream_steps`](Algorithm::stream_steps) drives that task on its own task and
+/// hands back the [`Step`] stream; [`process_request`](Algorithm::process_request)
+/// runs it to completion with the targets' default clients.
 ///
-/// Both methods take `&self`, not `&mut self`: the orchestrator shares one
-/// algorithm (`Arc<dyn Algorithm>`) across all requests and calls it concurrently,
+/// Methods take `self: Arc<Self>` / `&self`, not `&mut self`: the orchestrator shares
+/// one algorithm (`Arc<dyn Algorithm>`) across all requests and calls it concurrently,
 /// so an algorithm is responsible for its own thread-safety. Stateless algorithms
-/// (like the reference routers) get this for free; a stateful one must use
-/// interior mutability (e.g. a `Mutex`/`RwLock`/atomics over just its own state)
-/// rather than a coarse lock over the whole algorithm.
+/// (like the reference routers) get this for free; a stateful one must use interior
+/// mutability (e.g. a `Mutex`/`RwLock`/atomics over just its own state) rather than a
+/// coarse lock over the whole algorithm.
 #[async_trait]
-pub trait Algorithm: Send + Sync {
-    /// Run one request to completion: make the model calls the algorithm decides
-    /// on (via [`LlmTarget::call`]) and return the decision trace plus the final
-    /// response. Called concurrently for many requests, so it takes `&self`. Pass
-    /// `ctx` straight through to every [`LlmTarget::call`] — it carries the
-    /// per-request offload channel; the algorithm never inspects it.
-    async fn process_request(
-        &self,
-        ctx: &Context,
+pub trait Algorithm: Send + Sync + 'static {
+    /// Run one request to completion: make the model calls the algorithm decides on
+    /// (via [`SyDriver::call_target`] / [`SyDriver::call_model`]), publish decisions with
+    /// [`SyDriver::info`], and return the final response. Takes `self: Arc<Self>` so the
+    /// provided [`stream_steps`](Self::stream_steps) can drive it on its own task, plus
+    /// this call's [`SyDriver`] — offload every model call and decision on it. `ctx`
+    /// carries any cross-cutting request state.
+    async fn process_request_task(
+        self: Arc<Self>,
+        ctx: Context,
+        driver: SyDriver,
         request: Request,
-    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>>;
+    ) -> Result<Response, Box<dyn Error + Send + Sync>>;
+
     /// Feed the algorithm agentic-stack events (tool results, budgets, etc.). The
     /// reference algorithms ignore signals; a stateful algorithm updates its own
     /// (interior-mutable) state.
@@ -417,134 +466,74 @@ pub trait Algorithm: Send + Sync {
 
     /// The target set this algorithm routes among, if it has one. Lets a host (or
     /// the orchestrator) introspect the candidate models — e.g. to check that every
-    /// target can serve its own call before running `run_direct`.
+    /// target can serve its own call before running [`process_request`](Self::process_request).
     fn get_target_set(&self) -> &LlmTargetSet;
-}
 
-/// Drives one [`Algorithm`] over a [`LlmTargetSet`], the main entry point for a
-/// host. Cheap to share (`Arc<dyn Algorithm>` internally, no lock) and safe to call
-/// from many threads at once. Run requests with
-/// [`run_direct`](Self::run_direct) (targets serve their own
-/// calls) or [`run`](Self::run) (offloaded calls stream back for
-/// the host to fulfill).
-pub struct Switchyard {
-    // Shared, lock-free: `process_request` takes `&self`, so one algorithm serves
-    // every request concurrently. The target set lives on the algorithm; reach it
-    // via `algo.get_target_set()`.
-    algo: Arc<dyn Algorithm>,
-}
-
-impl Switchyard {
-    /// Build an orchestrator over an already-constructed algorithm. The algorithm
-    /// carries its own [`LlmTargetSet`] (see [`Algorithm::get_target_set`]);
-    /// offloading is wired per request by the [`Context`], not here.
-    pub fn new(algo: Arc<dyn Algorithm>) -> Self {
-        Switchyard { algo }
-    }
-
-    /// Run a request as a stream of [`Step`]s.
-    ///
-    /// Use this when some targets are client-less (calls are offloaded). Drive the
-    /// stream: on [`Step::CallLlm`], perform each promised model call
-    /// and fulfill it with [`CallLlmRequest::respond`]; the run ends with a
-    /// single [`Step::ReturnToAgent`] carrying the trace and response
-    /// (or an `Err` item if the algorithm or a call failed). Every call gets its
-    /// own promise channel, so concurrent `run` runs never interfere.
-    pub fn run(
-        &self,
-        request: Request,
-    ) -> impl futures::stream::Stream<Item = Result<Step, Box<dyn Error + Send + Sync>>> {
-        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(10);
-        // Per-request promise channel, carried in a fresh context: concurrent
-        // requests get independent channels, so offloaded promises never cross
-        // between requests. Nothing here is shared or locked, so many `run`
-        // calls run in parallel.
-        let (promise_tx, mut promise_rx) = tokio::sync::mpsc::unbounded_channel::<CallLlmRequest>();
-        let ctx = Context {
-            promise_tx: Some(promise_tx),
-        };
-        let algo = self.algo.clone();
-
-        // One driver task races two things: forwarding each offloaded promise to
-        // the caller as a `CallLlm` step, and the algorithm finishing (which
-        // yields the final `ReturnToAgent`). `process_request` runs on its own task
-        // — owning `ctx` so its targets offload to *this* request's channel —
-        // because it blocks awaiting promise responses the caller only produces
-        // after it receives the `CallLlm` step; the two must run concurrently, so a
-        // single receiver-loop cannot do both.
+    /// Run one request as a stream of [`Step`]s. Provided: build a fresh [`SyDriver`]
+    /// for this call, spawn [`process_request_task`](Self::process_request_task) on its
+    /// own task (handing it a producer-side clone of the driver), and emit the terminal
+    /// step when the task finishes. Because each call builds its own driver, many
+    /// `stream_steps`/`process_request` calls run in parallel with no shared step channel
+    /// — even when they share a `ctx`. Returns a boxed stream so `Arc<dyn Algorithm>`
+    /// stays object-safe.
+    fn stream_steps(self: Arc<Self>, ctx: Context, request: Request) -> StepStream {
+        // This call's own driver: take its consumer stream, hand a producer-side clone to
+        // the algorithm task, and keep one to emit the terminal step. The task blocks
+        // publishing a step until the consumer pulls the previous one.
+        let driver = SyDriver::new();
+        let stream = driver.stream();
         tokio::spawn(async move {
-            let mut algo_handle =
-                tokio::spawn(async move { algo.process_request(&ctx, request).await });
-
-            let mut recv_closed = false;
-            loop {
-                tokio::select! {
-                    maybe = promise_rx.recv(), if !recv_closed => match maybe {
-                        Some(promise) => {
-                            if stream_tx
-                                .send(Ok(Step::CallLlm(vec![promise])))
-                                .await
-                                .is_err()
-                            {
-                                // Consumer dropped the stream; stop the algo too.
-                                algo_handle.abort();
-                                return;
-                            }
-                        }
-                        None => recv_closed = true,
-                    },
-                    result = &mut algo_handle => {
-                        let step = match result {
-                            Ok(Ok((trace, response))) => {
-                                Ok(Step::ReturnToAgent(trace, response))
-                            }
-                            Ok(Err(err)) => Err(err),
-                            Err(join_err) => Err(Box::new(join_err) as Box<dyn Error + Send + Sync>),
-                        };
-                        let _ = stream_tx.send(step).await;
-                        return;
-                    }
-                }
-            }
+            let outcome = self
+                .process_request_task(ctx, driver.clone(), request)
+                .await;
+            let _ = driver.finish(outcome).await;
         });
-
-        ReceiverStream::new(stream_rx)
+        Box::pin(stream)
     }
 
-    /// Run a request without the stream: run the algorithm and return its decision
-    /// trace plus the final response. Only valid when every target has a client —
-    /// otherwise the algorithm may offload a call, and the channel-less context used
-    /// here gives a promise nowhere to go, so this errors up front.
-    pub async fn run_direct(
-        &self,
+    /// Run one request to completion, serving each offloaded call with its
+    /// [`RoutedRequest::default_client`], and return the decision trace plus the final
+    /// [`Response`]. Provided: drives [`stream_steps`](Self::stream_steps) internally,
+    /// collecting each [`Step::Decision`]. Use it when the algorithm holds its own model
+    /// clients and the host wants the answer (and the decisions behind it); drive
+    /// [`stream_steps`](Self::stream_steps) instead to serve the calls yourself. Errors
+    /// if a routed target has no client to serve its call, or the algorithm fails.
+    async fn process_request(
+        self: Arc<Self>,
+        ctx: Context,
         request: Request,
     ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
-        if !self.algo.get_target_set().all_have_clients() {
-            return Err(
-                "Cannot run directly: some targets lack clients and require offloading".into(),
-            );
+        let stream = self.stream_steps(ctx, request);
+        tokio::pin!(stream);
+        let mut trace: Vec<Arc<dyn Decision>> = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item? {
+                Step::CallLlm(call) => {
+                    // Serve the call with the target's default client, or error if the
+                    // routed target had none.
+                    let routed = call.get_routed()?.clone();
+                    let client = routed.default_client.clone().ok_or_else(|| {
+                        format!(
+                            "process_request: target '{}' has no client to serve the call",
+                            routed.decision.selected_model()
+                        )
+                    })?;
+                    call.respond(client.call(routed).await)?;
+                }
+                Step::Decision(decision) => trace.push(decision),
+                // The terminal step: return as soon as the algorithm finishes, rather
+                // than draining the stream until it closes.
+                Step::ReturnToAgent(response) => return Ok((trace, response)),
+            }
         }
-        // All targets have clients, so the algorithm never offloads a call. Run it
-        // directly (no lock — `process_request` takes `&self`) with a channel-less
-        // context, since no offload can occur.
-        self.algo
-            .process_request(&Context::default(), request)
-            .await
-    }
-
-    /// Feed agentic-stack signals to the algorithm (see [`Algorithm::process_signals`]).
-    pub async fn process_signals(
-        &self,
-        signals: Signals,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.algo.process_signals(signals).await
+        Err("process_request: stream ended without a final response".into())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_stream::StreamExt;
+    use futures::StreamExt;
 
     /// Mock client that echoes back the target name it was called with.
     struct EchoClient;
@@ -590,11 +579,12 @@ mod tests {
 
     #[async_trait]
     impl Algorithm for TestAlgo {
-        async fn process_request(
-            &self,
-            ctx: &Context,
+        async fn process_request_task(
+            self: Arc<Self>,
+            _ctx: Context,
+            driver: SyDriver,
             request: Request,
-        ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
+        ) -> Result<Response, Box<dyn Error + Send + Sync>> {
             let target = self
                 .target_set
                 .targets()
@@ -604,8 +594,8 @@ mod tests {
             let decision: Arc<dyn Decision> = Arc::new(TestDecision {
                 model: target.semantic_name.clone(),
             });
-            let response = target.call(ctx, request, decision.clone()).await?;
-            Ok((vec![decision], response))
+            driver.info(decision.clone()).await?;
+            driver.call_target(&target, request, decision).await
         }
 
         async fn process_signals(
@@ -620,9 +610,9 @@ mod tests {
         }
     }
 
-    /// Build an orchestrator over `TestAlgo` for the given target set.
-    fn orch(target_set: LlmTargetSet) -> Switchyard {
-        Switchyard::new(Arc::new(TestAlgo { target_set }))
+    /// Build a shared `TestAlgo` over the given target set.
+    fn orch(target_set: LlmTargetSet) -> Arc<dyn Algorithm> {
+        Arc::new(TestAlgo { target_set })
     }
 
     fn request() -> Request {
@@ -653,35 +643,31 @@ mod tests {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // A client-less target -> its call is offloaded via a promise the
         // orchestrator surfaces as a `CallLlm` step for us to fulfill.
-        let orch = orch(target_set(&[("offload/model", false)]));
-
-        let stream = orch.run(request());
+        let stream = orch(target_set(&[("offload/model", false)]))
+            .stream_steps(Context::default(), request());
         tokio::pin!(stream);
 
         let mut saw_call = false;
         let mut final_completion = None;
         while let Some(step) = stream.next().await {
             match step? {
-                Step::CallLlm(promises) => {
+                Step::CallLlm(call) => {
                     saw_call = true;
-                    for promise in promises {
-                        // The decision rode along with the promise.
-                        assert_eq!(promise.get_decision().selected_model(), "offload/model");
-                        // Fulfilling the promise is the "real" model call the caller makes.
-                        promise
-                            .respond(Ok(Response {
-                                llm_response: LlmResponse {
-                                    completion: "fulfilled".to_string(),
-                                    raw_response: None,
-                                },
-                                metadata: None,
-                            }))
-                            .await?;
-                    }
+                    // The decision rode along with the promise.
+                    assert_eq!(call.get_decision()?.selected_model(), "offload/model");
+                    // Fulfilling the promise is the "real" model call the caller makes.
+                    call.respond(Ok(Response {
+                        llm_response: LlmResponse {
+                            completion: "fulfilled".to_string(),
+                            raw_response: None,
+                        },
+                        metadata: None,
+                    }))?;
                 }
-                Step::ReturnToAgent(trace, response) => {
-                    assert_eq!(trace.len(), 1);
-                    assert_eq!(trace[0].selected_model(), "offload/model");
+                Step::Decision(decision) => {
+                    assert_eq!(decision.selected_model(), "offload/model");
+                }
+                Step::ReturnToAgent(response) => {
                     final_completion = Some(response.llm_response.completion);
                 }
             }
@@ -696,43 +682,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_with_direct_client_returns_without_offload(
+    async fn client_backed_target_offloads_with_a_default_client(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // A target with a client serves its own call, so no promise is emitted.
-        let orch = orch(target_set(&[("direct/model", true)]));
-
-        let stream = orch.run(request());
+        // Every call now offloads to the stream; a client-backed target rides its
+        // client along as `default_client` so the consumer can serve it by default.
+        let stream =
+            orch(target_set(&[("direct/model", true)])).stream_steps(Context::default(), request());
         tokio::pin!(stream);
 
-        let mut steps = Vec::new();
+        let mut final_completion = None;
         while let Some(step) = stream.next().await {
-            steps.push(step?);
+            match step? {
+                Step::CallLlm(call) => {
+                    let routed = call.get_routed()?.clone();
+                    let client = routed
+                        .default_client
+                        .clone()
+                        .ok_or("expected a default client")?;
+                    let result = client.call(routed).await;
+                    call.respond(result)?;
+                }
+                Step::Decision(_) => {}
+                Step::ReturnToAgent(response) => {
+                    final_completion = Some(response.llm_response.completion);
+                }
+            }
         }
 
-        assert_eq!(
-            steps.len(),
-            1,
-            "direct client should not emit a CallLlm step"
-        );
-        match &steps[0] {
-            Step::ReturnToAgent(trace, response) => {
-                assert_eq!(trace[0].selected_model(), "direct/model");
-                // EchoClient echoes the model name back as the completion.
-                assert_eq!(response.llm_response.completion, "direct/model");
-            }
-            Step::CallLlm(_) => return Err("expected ReturnToAgent".into()),
-        }
+        // EchoClient echoes the model name back as the completion.
+        assert_eq!(final_completion.ok_or("no ReturnToAgent")?, "direct/model");
         Ok(())
     }
 
     #[tokio::test]
-    async fn run_direct_returns_the_response_when_all_targets_have_clients(
+    async fn process_request_returns_the_response_when_all_targets_have_clients(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Every target has a client -> no call is ever offloaded, so we can skip
-        // the stream and get the final response directly.
-        let orch = orch(target_set(&[("direct/model", true)]));
-
-        let (trace, response) = orch.run_direct(request()).await?;
+        // Every target has a client, so process_request serves every call via the
+        // default client and returns the trace + final response.
+        let (trace, response) = orch(target_set(&[("direct/model", true)]))
+            .process_request(Context::default(), request())
+            .await?;
         // TestAlgo calls the first target; EchoClient echoes its name.
         assert_eq!(response.llm_response.completion, "direct/model");
         assert_eq!(trace[0].selected_model(), "direct/model");
@@ -740,13 +729,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_direct_errors_when_a_target_lacks_a_client(
+    async fn process_request_errors_when_a_target_lacks_a_client(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // A client-less target could offload a call via a promise that nobody
-        // would fulfill, so run_direct refuses up front.
-        let orch = orch(target_set(&[("offload/model", false)]));
-
-        assert!(orch.run_direct(request()).await.is_err());
+        // A client-less target has no default client to serve its offloaded call, so
+        // driving it to completion errors.
+        assert!(orch(target_set(&[("offload/model", false)]))
+            .process_request(Context::default(), request())
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -760,8 +750,8 @@ mod tests {
         // A client that blocks until all N concurrent calls have arrived. If
         // requests were serialized (one algorithm behind a `Mutex`), only one
         // call could be in flight, the barrier would never reach N, and the test
-        // would time out. It passes only because `run_direct` runs the
-        // shared algorithm concurrently.
+        // would time out. It passes only because the shared algorithm is driven
+        // concurrently across requests.
         struct BarrierClient {
             barrier: Arc<Barrier>,
         }
@@ -790,14 +780,14 @@ mod tests {
                 barrier: barrier.clone(),
             })),
         }]);
-        // One orchestrator shared (by `&`) across many concurrent requests.
-        let orch = Arc::new(orch(targets));
+        // One shared algorithm driven by many concurrent requests.
+        let algo = orch(targets);
 
         let mut handles = Vec::new();
         for _ in 0..N {
-            let orch = orch.clone();
+            let algo = algo.clone();
             handles.push(tokio::spawn(async move {
-                orch.run_direct(request())
+                algo.process_request(Context::default(), request())
                     .await
                     .map(|(_, response)| response.llm_response.completion)
             }));
@@ -815,28 +805,24 @@ mod tests {
     async fn offload_error_propagates_back_to_the_algorithm(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // A client-less target offloads its call; we fulfill the promise with an
-        // Err, which must flow back through `target.call` into the algorithm and
+        // Err, which must flow back through `call_target` into the algorithm and
         // out as an error step — not a response.
-        let orch = orch(target_set(&[("offload/model", false)]));
-
-        let stream = orch.run(request());
+        let stream = orch(target_set(&[("offload/model", false)]))
+            .stream_steps(Context::default(), request());
         tokio::pin!(stream);
 
         let mut saw_error = false;
         while let Some(step) = stream.next().await {
             match step {
-                Ok(Step::CallLlm(promises)) => {
-                    for promise in promises {
-                        promise
-                            .respond(Err("upstream model call failed".into()))
-                            .await?;
-                    }
+                Ok(Step::CallLlm(call)) => {
+                    call.respond(Err("upstream model call failed".into()))?;
                 }
+                Ok(Step::Decision(_)) => {}
                 Ok(Step::ReturnToAgent(..)) => {
                     return Err("expected the offload error to propagate, got a response".into());
                 }
                 Err(err) => {
-                    // The algorithm's `target.call` saw the error via the promise.
+                    // The algorithm's `call_target` saw the error via the promise.
                     assert!(err.to_string().contains("upstream model call failed"));
                     saw_error = true;
                 }
